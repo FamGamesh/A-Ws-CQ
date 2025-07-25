@@ -1,16 +1,19 @@
-# Environment variables for MCQ Scraper
+# Production Environment Variables for MCQ Scraper
 AWS_REGION=us-east-1
-ENVIRONMENT=development
+ENVIRONMENT=production
 SCRAPING_APPROACH=http_requests
 
 # Google Custom Search API Configuration
+GOOGLE_API_KEY=AIzaSyAsoKcq2DMgtRw-L_3inX9Cq-V6-YNOAVg
 SEARCH_ENGINE_ID=2701a7d64a00d47fd
-GOOGLE_API_KEY=
-API_KEY_POOL=
+API_KEY_POOL=AIzaSyAsoKcq2DMgtRw-L_3inX9Cq-V6-YNOAVg,AIzaSyCb8zhG3NKzsRvpSb7FwgleNMSSLiQyYpY,AIzaSyAS5G7JOwXCC8BSJwr6aTRpEKpYl8L877k,AIzaSyCONl4UcQq6cMTi3wwQQruhu9WoAJa2gX8,AIzaSyB-m_rEg8A9v8TeKJmMJ3dtEm51O_BqjrU
 
 # MongoDB Configuration
-MONGO_URL=mongodb://localhost:27017/mcq_scraper
-DB_NAME=mcq_scraper
+MONGO_URL=mongodb+srv://futexi:2Lzmponw0QiMCYw2@cluster0.tb6golz.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0
+DB_NAME=mcq_scraper_production
+
+# Playwright Configuration
+PLAYWRIGHT_BROWSERS_PATH=/tmp/pw-browsers
 
 # S3 Configuration
 PDF_STORAGE_BUCKET=mcq-scraper-pdfs-default
