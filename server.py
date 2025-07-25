@@ -560,7 +560,13 @@ async def read_root():
         "version": "4.0.0",
         "approach": "http_requests_scraping",
         "browser_required": False,
-        "status": "running"
+        "status": "running",
+        "available_endpoints": [
+            "GET /api/health",
+            "POST /api/scrape-mcqs",
+            "GET /api/job-status/{job_id}",
+            "GET /api/download-pdf/{job_id}"
+        ]
     }
 
 @app.get("/api/health")
@@ -577,6 +583,296 @@ async def health_check():
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
+
+@app.post("/api/scrape-mcqs")
+async def scrape_mcqs(request: ScrapeRequest, background_tasks: BackgroundTasks):
+    """Start MCQ scraping job"""
+    try:
+        # Generate unique job ID
+        job_id = str(uuid.uuid4())
+        
+        # Initialize job in persistent storage
+        persistent_storage.update_job(
+            job_id=job_id,
+            status="started",
+            progress="Initializing MCQ scraping job...",
+            total_links=0,
+            processed_links=0,
+            mcqs_found=0
+        )
+        
+        # Start background scraping task
+        background_tasks.add_task(
+            process_mcq_scraping_job,
+            job_id=job_id,
+            topic=request.topic,
+            exam_type=request.exam_type,
+            max_mcqs=request.max_mcqs
+        )
+        
+        return JobResponse(
+            job_id=job_id,
+            status="started",
+            message=f"MCQ scraping job started for topic '{request.topic}' and exam type '{request.exam_type}'"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error starting MCQ scraping job: {e}")
+        raise HTTPException(status_code=500, detail=f"Error starting scraping job: {str(e)}")
+
+@app.get("/api/job-status/{job_id}")
+async def get_job_status(job_id: str):
+    """Get job status and progress"""
+    try:
+        job_data = persistent_storage.get_job(job_id)
+        
+        if not job_data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        return JobStatusResponse(**job_data)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting job status: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting job status: {str(e)}")
+
+@app.get("/api/download-pdf/{job_id}")
+async def download_pdf(job_id: str):
+    """Download generated PDF"""
+    try:
+        job_data = persistent_storage.get_job(job_id)
+        
+        if not job_data:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        pdf_url = job_data.get('pdf_url')
+        if not pdf_url:
+            raise HTTPException(status_code=404, detail="PDF not available yet")
+        
+        # For Lambda with S3 integration, return the S3 URL
+        return {"download_url": pdf_url}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error downloading PDF: {e}")
+        raise HTTPException(status_code=500, detail=f"Error downloading PDF: {str(e)}")
+
+# Background task function
+async def process_mcq_scraping_job(job_id: str, topic: str, exam_type: str, max_mcqs: int):
+    """Process MCQ scraping job in background"""
+    try:
+        # Initialize HTTP scraper
+        if not http_scraper.is_initialized:
+            http_scraper.initialize()
+        
+        # Update job status
+        persistent_storage.update_job(
+            job_id=job_id,
+            status="searching",
+            progress="Searching for MCQ sources...",
+            total_links=0,
+            processed_links=0,
+            mcqs_found=0
+        )
+        
+        # Search for MCQ URLs using Google Custom Search
+        search_urls = await search_mcq_urls(topic, exam_type, max_mcqs)
+        
+        if not search_urls:
+            persistent_storage.update_job(
+                job_id=job_id,
+                status="failed",
+                progress="No MCQ sources found",
+                total_links=0,
+                processed_links=0,
+                mcqs_found=0
+            )
+            return
+        
+        # Update job with search results
+        persistent_storage.update_job(
+            job_id=job_id,
+            status="scraping",
+            progress="Scraping MCQs from sources...",
+            total_links=len(search_urls),
+            processed_links=0,
+            mcqs_found=0
+        )
+        
+        # Scrape MCQs from URLs
+        mcqs = []
+        processed_count = 0
+        
+        for url in search_urls:
+            try:
+                mcq_data = await http_scraper.scrape_mcq_page(url, topic, exam_type)
+                if mcq_data:
+                    mcqs.append(mcq_data)
+                
+                processed_count += 1
+                
+                # Update progress
+                persistent_storage.update_job(
+                    job_id=job_id,
+                    status="scraping",
+                    progress=f"Scraped {processed_count}/{len(search_urls)} sources...",
+                    total_links=len(search_urls),
+                    processed_links=processed_count,
+                    mcqs_found=len(mcqs)
+                )
+                
+                # Stop if we have enough MCQs
+                if len(mcqs) >= max_mcqs:
+                    break
+                    
+            except Exception as e:
+                logger.error(f"Error scraping URL {url}: {e}")
+                continue
+        
+        if not mcqs:
+            persistent_storage.update_job(
+                job_id=job_id,
+                status="failed",
+                progress="No MCQs found",
+                total_links=len(search_urls),
+                processed_links=processed_count,
+                mcqs_found=0
+            )
+            return
+        
+        # Generate PDF
+        persistent_storage.update_job(
+            job_id=job_id,
+            status="generating_pdf",
+            progress="Generating PDF...",
+            total_links=len(search_urls),
+            processed_links=processed_count,
+            mcqs_found=len(mcqs)
+        )
+        
+        pdf_url = await generate_mcq_pdf(mcqs, topic, exam_type, job_id)
+        
+        if pdf_url:
+            persistent_storage.update_job(
+                job_id=job_id,
+                status="completed",
+                progress="PDF generated successfully",
+                total_links=len(search_urls),
+                processed_links=processed_count,
+                mcqs_found=len(mcqs),
+                pdf_url=pdf_url
+            )
+        else:
+            persistent_storage.update_job(
+                job_id=job_id,
+                status="failed",
+                progress="PDF generation failed",
+                total_links=len(search_urls),
+                processed_links=processed_count,
+                mcqs_found=len(mcqs)
+            )
+            
+    except Exception as e:
+        logger.error(f"Error processing MCQ scraping job {job_id}: {e}")
+        persistent_storage.update_job(
+            job_id=job_id,
+            status="failed",
+            progress=f"Job failed: {str(e)}",
+            total_links=0,
+            processed_links=0,
+            mcqs_found=0
+        )
+
+# Helper functions
+async def search_mcq_urls(topic: str, exam_type: str, max_mcqs: int) -> List[str]:
+    """Search for MCQ URLs using Google Custom Search"""
+    try:
+        # Construct search query
+        query = f"{topic} MCQ {exam_type} questions answers"
+        
+        # Use Google Custom Search API
+        api_key = api_key_manager.get_current_key()
+        search_url = "https://www.googleapis.com/customsearch/v1"
+        
+        params = {
+            'key': api_key,
+            'cx': SEARCH_ENGINE_ID,
+            'q': query,
+            'num': min(max_mcqs, 10)  # Max 10 results per request
+        }
+        
+        response = requests.get(search_url, params=params, timeout=10)
+        response.raise_for_status()
+        
+        data = response.json()
+        urls = []
+        
+        for item in data.get('items', []):
+            urls.append(item['link'])
+        
+        return urls
+        
+    except Exception as e:
+        logger.error(f"Error searching MCQ URLs: {e}")
+        return []
+
+async def generate_mcq_pdf(mcqs: List[dict], topic: str, exam_type: str, job_id: str) -> Optional[str]:
+    """Generate PDF from MCQs"""
+    try:
+        # Get PDF directory
+        pdf_dir = get_pdf_directory()
+        
+        # Create PDF filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pdf_filename = f"mcq_{topic.replace(' ', '_')}_{exam_type}_{timestamp}.pdf"
+        pdf_path = pdf_dir / pdf_filename
+        
+        # Generate PDF using ReportLab
+        doc = SimpleDocTemplate(str(pdf_path), pagesize=A4)
+        story = []
+        styles = getSampleStyleSheet()
+        
+        # Title
+        title = Paragraph(f"MCQ Questions - {topic} ({exam_type})", styles['Title'])
+        story.append(title)
+        story.append(Spacer(1, 20))
+        
+        # Add MCQs
+        for i, mcq in enumerate(mcqs, 1):
+            # Question
+            question = Paragraph(f"<b>Q{i}.</b> {mcq['question']}", styles['Normal'])
+            story.append(question)
+            story.append(Spacer(1, 10))
+            
+            # Options
+            for j, option in enumerate(mcq.get('options', []), 1):
+                option_text = Paragraph(f"  {chr(64+j)}. {option}", styles['Normal'])
+                story.append(option_text)
+            
+            story.append(Spacer(1, 10))
+            
+            # Answer
+            if mcq.get('answer'):
+                answer = Paragraph(f"<b>Answer:</b> {mcq['answer']}", styles['Normal'])
+                story.append(answer)
+            
+            story.append(Spacer(1, 20))
+        
+        # Build PDF
+        doc.build(story)
+        
+        # Upload to S3 if in Lambda environment
+        if LAMBDA_S3_INTEGRATION:
+            pdf_url = upload_pdf_to_s3_lambda(str(pdf_path), job_id, topic, exam_type)
+            return pdf_url
+        else:
+            return str(pdf_path)
+            
+    except Exception as e:
+        logger.error(f"Error generating PDF: {e}")
+        return None
 
 print("============================================================")
 print("MCQ SCRAPER - HTTP SCRAPING FINAL VERSION")
