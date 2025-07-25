@@ -569,6 +569,41 @@ async def read_root():
         ]
     }
 
+@app.get("/api/test-search")
+async def test_search_functionality():
+    """Test search functionality and API configuration"""
+    try:
+        # Test API key availability
+        api_status = {
+            "api_keys_available": len(api_key_manager.api_keys) > 0,
+            "total_api_keys": len(api_key_manager.api_keys),
+            "search_engine_id": SEARCH_ENGINE_ID
+        }
+        
+        # Test a simple search
+        test_urls = await search_mcq_urls("Mathematics", "SSC", 3)
+        
+        return {
+            "status": "success",
+            "api_configuration": api_status,
+            "test_search_results": {
+                "urls_found": len(test_urls),
+                "sample_urls": test_urls[:3] if test_urls else [],
+                "search_method": "google_custom_search" if api_status["api_keys_available"] else "fallback_urls"
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "error": str(e),
+            "api_configuration": {
+                "api_keys_available": False,
+                "total_api_keys": 0,
+                "search_engine_id": SEARCH_ENGINE_ID
+            }
+        }
+
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint with HTTP scraping status"""
@@ -787,8 +822,31 @@ async def process_mcq_scraping_job(job_id: str, topic: str, exam_type: str, max_
 
 # Helper functions
 async def search_mcq_urls(topic: str, exam_type: str, max_mcqs: int) -> List[str]:
-    """Search for MCQ URLs using Google Custom Search"""
+    """Search for MCQ URLs using Google Custom Search with fallback"""
     try:
+        # First try Google Custom Search API
+        urls = await try_google_custom_search(topic, exam_type, max_mcqs)
+        
+        if urls:
+            logger.info(f"Found {len(urls)} URLs via Google Custom Search")
+            return urls
+        
+        # Fallback to predefined MCQ sites
+        logger.warning("Google Custom Search failed, using fallback URLs")
+        return get_fallback_mcq_urls(topic, exam_type, max_mcqs)
+        
+    except Exception as e:
+        logger.error(f"Error in search_mcq_urls: {e}")
+        return get_fallback_mcq_urls(topic, exam_type, max_mcqs)
+
+async def try_google_custom_search(topic: str, exam_type: str, max_mcqs: int) -> List[str]:
+    """Try Google Custom Search API"""
+    try:
+        # Check if API key is available
+        if not api_key_manager.api_keys:
+            logger.warning("No Google API keys available")
+            return []
+        
         # Construct search query
         query = f"{topic} MCQ {exam_type} questions answers"
         
@@ -803,20 +861,56 @@ async def search_mcq_urls(topic: str, exam_type: str, max_mcqs: int) -> List[str
             'num': min(max_mcqs, 10)  # Max 10 results per request
         }
         
-        response = requests.get(search_url, params=params, timeout=10)
+        logger.info(f"Searching Google Custom Search for: {query}")
+        response = requests.get(search_url, params=params, timeout=15)
+        
+        if response.status_code == 403:
+            logger.error("Google API quota exceeded or invalid API key")
+            return []
+        
         response.raise_for_status()
-        
         data = response.json()
-        urls = []
         
+        urls = []
         for item in data.get('items', []):
             urls.append(item['link'])
         
+        logger.info(f"Google Custom Search returned {len(urls)} URLs")
         return urls
         
     except Exception as e:
-        logger.error(f"Error searching MCQ URLs: {e}")
+        logger.error(f"Google Custom Search error: {e}")
         return []
+
+def get_fallback_mcq_urls(topic: str, exam_type: str, max_mcqs: int) -> List[str]:
+    """Get fallback MCQ URLs when Google Search fails"""
+    # Popular MCQ websites with topic-specific URLs
+    fallback_sites = [
+        f"https://www.examveda.com/{topic.lower()}-mcq-questions-answers/",
+        f"https://www.indiabix.com/{topic.lower()}-questions-and-answers/",
+        f"https://www.freshersworld.com/{topic.lower()}-questions-and-answers/",
+        f"https://www.geeksforgeeks.org/{topic.lower()}-multiple-choice-questions/",
+        f"https://www.javatpoint.com/{topic.lower()}-mcq",
+        f"https://www.sanfoundry.com/{topic.lower()}-questions-answers/",
+        f"https://www.tutorialspoint.com/{topic.lower()}-questions-answers/",
+        f"https://www.studytonight.com/{topic.lower()}-mcqs/",
+        f"https://www.careerride.com/{topic.lower()}-mcqs/",
+        f"https://www.youth4work.com/{topic.lower()}-mcq-questions/"
+    ]
+    
+    # Filter by exam type if SSC
+    if exam_type.lower() == "ssc":
+        ssc_sites = [
+            f"https://www.sscadda.com/{topic.lower()}-questions-for-ssc-exams/",
+            f"https://www.oliveboard.in/ssc/{topic.lower()}-questions/",
+            f"https://www.testbook.com/ssc/{topic.lower()}-questions/",
+            f"https://www.gradeup.co/ssc/{topic.lower()}-questions/",
+            f"https://www.jagran.com/ssc/{topic.lower()}-mcq/"
+        ]
+        fallback_sites.extend(ssc_sites)
+    
+    # Return limited number of URLs
+    return fallback_sites[:min(max_mcqs, 10)]
 
 async def generate_mcq_pdf(mcqs: List[dict], topic: str, exam_type: str, job_id: str) -> Optional[str]:
     """Generate PDF from MCQs"""
