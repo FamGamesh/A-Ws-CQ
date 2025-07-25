@@ -1,7 +1,7 @@
-# Production AWS Lambda Dockerfile
+# Production AWS Lambda Dockerfile with Fixed Playwright
 FROM public.ecr.aws/lambda/python:3.11
 
-# Install system dependencies for Playwright
+# Install system dependencies for Playwright with Amazon Linux compatibility
 RUN yum update -y && \
     yum install -y \
     wget \
@@ -10,6 +10,12 @@ RUN yum update -y && \
     xz \
     tar \
     gzip \
+    which \
+    at-spi2-atk \
+    cups-libs \
+    gtk3 \
+    ipa-gothic-fonts \
+    libdrm \
     libX11 \
     libXcomposite \
     libXcursor \
@@ -20,19 +26,10 @@ RUN yum update -y && \
     libXrender \
     libXss \
     libXtst \
-    libxcb \
-    libdrm \
-    libxkbcommon \
-    libatspi \
-    libnss3 \
-    libgtk-3 \
-    libasound2 \
-    libgcc \
-    fontconfig \
-    freetype && \
-    yum clean all
+    xorg-x11-server-Xvfb \
+    && yum clean all
 
-# Set Playwright environment variables
+# Set Playwright environment variables for Lambda
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/python/pw-browsers
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
 ENV PYTHONPATH=/opt/python:/var/task
@@ -46,9 +43,10 @@ COPY requirements-lambda.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir --target /opt/python -r requirements-lambda.txt
 
-# Install Playwright browsers in the correct location
+# Install Playwright browsers with better compatibility
 RUN cd /opt/python && \
-    python -m playwright install chromium --with-deps && \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/python/pw-browsers python -m playwright install-deps && \
+    PLAYWRIGHT_BROWSERS_PATH=/opt/python/pw-browsers python -m playwright install chromium && \
     find /opt/python/pw-browsers -name "*.so*" -exec strip {} \; 2>/dev/null || true
 
 # Copy application code
