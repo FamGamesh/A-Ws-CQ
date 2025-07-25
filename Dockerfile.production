@@ -1,7 +1,7 @@
-# PRODUCTION AWS Lambda Dockerfile - FIXED for Playwright Installation
+# PRODUCTION AWS Lambda Dockerfile - ALTERNATIVE CHROME BINARY APPROACH
 FROM public.ecr.aws/lambda/python:3.11
 
-# Install system dependencies and fix GLIBC compatibility issues
+# Install system dependencies for Chrome
 RUN yum update -y && \
     yum install -y \
     wget \
@@ -31,20 +31,30 @@ RUN yum update -y && \
     nspr \
     atk \
     at-spi2-atk \
-    glibc \
-    gcompat \
+    libxkbcommon \
     && yum clean all
 
-# Set Lambda-compatible environment variables
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/python/pw-browsers
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0  
+# Set Chrome-compatible environment variables
+ENV CHROME_BINARY_PATH=/opt/chrome/chrome
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/chrome
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV PYTHONPATH=/opt/python:/var/task
-ENV BROWSER_EXECUTABLE_PATH=/opt/python/pw-browsers/chromium-1148/chrome-linux/chrome
 
-# Create required directories with proper permissions
-RUN mkdir -p /opt/python/pw-browsers /tmp/pdfs /var/task && \
-    chmod -R 755 /opt/python && \
+# Create required directories
+RUN mkdir -p /opt/chrome /tmp/pdfs /var/task && \
+    chmod -R 755 /opt/chrome && \
     chmod -R 777 /tmp
+
+# Download and install Chrome for Amazon Linux (compatible version)
+RUN cd /opt && \
+    # Download Chromium compatible with Amazon Linux 2
+    wget -q https://github.com/adieuadieu/serverless-chrome/releases/download/v1.0.0-57/stable-headless-chromium-amazonlinux-2.zip && \
+    unzip stable-headless-chromium-amazonlinux-2.zip && \
+    mv headless-chromium /opt/chrome/chrome && \
+    chmod +x /opt/chrome/chrome && \
+    rm stable-headless-chromium-amazonlinux-2.zip && \
+    # Verify Chrome installation
+    /opt/chrome/chrome --version || echo "Chrome installation warning - will retry at runtime"
 
 # Copy requirements first for better Docker layer caching
 COPY requirements-lambda.txt .
@@ -52,47 +62,22 @@ COPY requirements-lambda.txt .
 # Install Python dependencies to Lambda layer directory
 RUN pip install --no-cache-dir --target /opt/python -r requirements-lambda.txt
 
-# FIXED: Install Playwright browsers with enhanced Amazon Linux compatibility
-RUN cd /opt/python && \
-    export PLAYWRIGHT_BROWSERS_PATH=/opt/python/pw-browsers && \
-    export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0 && \
-    # Install system dependencies for Playwright
-    python -m playwright install-deps chromium 2>/dev/null || true && \
-    # Install Chromium browser with proper error handling
-    python -m playwright install chromium && \
-    # Verify installation
-    ls -la /opt/python/pw-browsers && \
-    # Strip binaries to reduce size
-    find /opt/python/pw-browsers -name "*.so*" -exec strip {} \; 2>/dev/null || true && \
-    # Set proper permissions
-    chmod -R 755 /opt/python/pw-browsers
-
 # Copy application code to Lambda task directory
 COPY server.py competitive_exam_keywords.py health_check.py ./
 COPY install_playwright.py post_deploy_setup.py ./  
 COPY lambda_handler_production.py ./
 COPY s3_production_integration.py ./
 
-# FIXED: Create a wrapper script for browser initialization
-RUN echo '#!/bin/bash\n\
-export PLAYWRIGHT_BROWSERS_PATH=/opt/python/pw-browsers\n\
-export BROWSER_EXECUTABLE_PATH=/opt/python/pw-browsers/chromium-*/chrome-linux/chrome\n\
-exec "$@"' > /usr/local/bin/browser-wrapper && \
-    chmod +x /usr/local/bin/browser-wrapper
-
 # Set proper executable permissions  
 RUN chmod +x lambda_handler_production.py install_playwright.py post_deploy_setup.py
 
-# Create a startup verification script
-RUN echo 'import os; import sys; sys.path.insert(0, "/opt/python"); \
-from playwright.sync_api import sync_playwright; \
-p = sync_playwright().start(); \
-browser = p.chromium.launch(headless=True); \
-print("✅ Playwright browser verification successful"); \
-browser.close(); p.stop()' > /tmp/verify_browsers.py
-
-# Verify browser installation during build
-RUN cd /opt/python && python /tmp/verify_browsers.py || echo "⚠️ Browser verification failed, will retry at runtime"
+# Create Chrome verification script
+RUN echo '#!/bin/bash\n\
+echo "Testing Chrome binary..."\n\
+/opt/chrome/chrome --version\n\
+echo "Chrome verification completed"' > /opt/verify_chrome.sh && \
+    chmod +x /opt/verify_chrome.sh && \
+    /opt/verify_chrome.sh || echo "⚠️ Chrome verification failed, will retry at runtime"
 
 # Set the Lambda handler
 CMD ["lambda_handler_production.handler"]

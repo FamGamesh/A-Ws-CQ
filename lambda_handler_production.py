@@ -1,6 +1,6 @@
 """
-FIXED Production Lambda Handler for MCQ Scraper
-Enhanced with proper Playwright browser initialization and error handling
+Production Lambda Handler for MCQ Scraper
+FIXED: Alternative Chrome Binary Approach for GLIBC Compatibility
 """
 
 import os
@@ -19,8 +19,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class EnhancedProductionLambdaHandler:
-    """Enhanced Production-ready Lambda handler with fixed Playwright support"""
+class ChromeBinaryProductionLambdaHandler:
+    """Production Lambda handler using Chrome binary instead of Playwright driver"""
     
     def __init__(self):
         self.s3_client = None
@@ -32,19 +32,22 @@ class EnhancedProductionLambdaHandler:
             "installed": False,
             "installation_attempted": False,
             "installation_error": None,
-            "browser_pool_initialized": False
+            "browser_pool_initialized": False,
+            "chrome_version": None
         }
     
     def initialize(self):
-        """Initialize Lambda environment with fixed browser setup"""
+        """Initialize Lambda environment with Chrome binary setup"""
         if self.initialized:
             return
             
         try:
-            logger.info("🚀 Initializing Enhanced Production Lambda Handler...")
+            logger.info("🚀 Initializing Chrome Binary Production Lambda Handler...")
             
-            # Set Lambda-specific environment variables  
-            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/opt/python/pw-browsers'
+            # Set Chrome-specific environment variables  
+            os.environ['CHROME_BINARY_PATH'] = '/opt/chrome/chrome'
+            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/opt/chrome'
+            os.environ['PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD'] = '1'
             os.environ['ENVIRONMENT'] = 'lambda'
             os.environ['PYTHONPATH'] = '/opt/python:/var/task'
             
@@ -55,8 +58,8 @@ class EnhancedProductionLambdaHandler:
             # Load secrets
             self._load_secrets()
             
-            # FIXED: Initialize browser environment before importing app
-            self._initialize_browser_environment()
+            # FIXED: Initialize Chrome binary environment
+            self._initialize_chrome_environment()
             
             # Import and initialize FastAPI app
             from server import app
@@ -64,71 +67,66 @@ class EnhancedProductionLambdaHandler:
             self.mangum_handler = Mangum(app, lifespan="off")
             
             self.initialized = True
-            logger.info("✅ Enhanced Production Lambda handler initialized successfully")
+            logger.info("✅ Chrome Binary Production Lambda handler initialized successfully")
             
         except Exception as e:
             logger.error(f"❌ Error initializing Lambda handler: {e}")
             logger.error(traceback.format_exc())
             raise
     
-    def _initialize_browser_environment(self):
-        """Initialize browser environment for Playwright"""
+    def _initialize_chrome_environment(self):
+        """Initialize Chrome binary environment"""
         try:
-            logger.info("🔧 Initializing browser environment...")
+            logger.info("🔧 Initializing Chrome binary environment...")
             
             self.browser_status["installation_attempted"] = True
             
-            # Set up environment for browser detection
-            browser_path = '/opt/python/pw-browsers'
+            # Check if Chrome binary exists
+            chrome_path = '/opt/chrome/chrome'
             
-            if not os.path.exists(browser_path):
-                raise Exception(f"Browser directory not found: {browser_path}")
+            if not os.path.exists(chrome_path):
+                raise Exception(f"Chrome binary not found: {chrome_path}")
             
-            # Look for installed Chromium
-            chromium_found = False
-            executable_path = None
+            if not os.access(chrome_path, os.X_OK):
+                # Fix permissions
+                import stat
+                os.chmod(chrome_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+                logger.info("🔧 Fixed Chrome binary permissions")
             
-            for item in os.listdir(browser_path):
-                if 'chromium' in item.lower():
-                    item_path = os.path.join(browser_path, item)
-                    if os.path.isdir(item_path):
-                        # Try to find the executable
-                        possible_executables = [
-                            os.path.join(item_path, 'chrome-linux', 'chrome'),
-                            os.path.join(item_path, 'chrome-linux', 'headless_shell'),
-                            os.path.join(item_path, 'chromium-linux', 'chrome'),
-                            os.path.join(item_path, 'chromium'),
-                            os.path.join(item_path, 'chrome')
-                        ]
-                        
-                        for exe_path in possible_executables:
-                            if os.path.exists(exe_path) and os.access(exe_path, os.X_OK):
-                                executable_path = exe_path
-                                chromium_found = True
-                                logger.info(f"✅ Found Chromium executable: {executable_path}")
-                                break
-                        
-                        if chromium_found:
-                            break
+            # Test Chrome binary
+            try:
+                import subprocess
+                result = subprocess.run([chrome_path, '--version'], 
+                                     capture_output=True, text=True, timeout=10)
+                
+                if result.returncode == 0:
+                    chrome_version = result.stdout.strip()
+                    logger.info(f"✅ Chrome binary verified: {chrome_version}")
+                    self.browser_status["chrome_version"] = chrome_version
+                    self.browser_status["installed"] = True
+                    self.browser_status["browser_pool_initialized"] = True
+                else:
+                    raise Exception(f"Chrome version check failed: {result.stderr}")
+                    
+            except subprocess.TimeoutExpired:
+                raise Exception("Chrome binary test timeout")
+            except Exception as e:
+                raise Exception(f"Chrome binary test failed: {e}")
             
-            if chromium_found:
-                # Set browser executable path for the application
-                os.environ['BROWSER_EXECUTABLE_PATH'] = executable_path
-                self.browser_status["installed"] = True
-                self.browser_status["browser_pool_initialized"] = True
-                logger.info("✅ Browser environment initialized successfully")
-            else:
-                raise Exception("No Chromium executable found in browser directory")
+            # Set browser executable path for Playwright
+            os.environ['BROWSER_EXECUTABLE_PATH'] = chrome_path
+            
+            logger.info("✅ Chrome binary environment initialized successfully")
                 
         except Exception as e:
-            error_msg = f"Browser initialization failed: {e}"
+            error_msg = f"Chrome binary initialization failed: {e}"
             logger.error(f"❌ {error_msg}")
             self.browser_status["installation_error"] = error_msg
             self.browser_status["installed"] = False
             self.browser_status["browser_pool_initialized"] = False
             
             # Continue without browsers - app will handle gracefully
-            logger.warning("⚠️ Continuing without browser initialization")
+            logger.warning("⚠️ Continuing without Chrome binary initialization")
     
     def _load_secrets(self):
         """Load secrets from AWS Secrets Manager"""
@@ -180,8 +178,8 @@ class EnhancedProductionLambdaHandler:
                 self.initialize()
             
             # Log request details
-            method = event.get('httpMethod', 'UNKNOWN')
-            path = event.get('path', '/')
+            method = event.get('httpMethod', event.get('requestContext', {}).get('http', {}).get('method', 'UNKNOWN'))
+            path = event.get('path', event.get('rawPath', '/'))
             logger.info(f"📥 Processing: {method} {path}")
             
             # Handle CORS preflight requests
@@ -240,14 +238,14 @@ class EnhancedProductionLambdaHandler:
         }
 
 # Global handler instance
-enhanced_production_handler = EnhancedProductionLambdaHandler()
+chrome_production_handler = ChromeBinaryProductionLambdaHandler()
 
 def handler(event, context):
     """
-    Enhanced Lambda entry point with fixed browser support
+    Chrome Binary Lambda entry point
     This is the function that AWS Lambda will call
     """
-    return enhanced_production_handler.handle_request(event, context)
+    return chrome_production_handler.handle_request(event, context)
 
 # For backward compatibility
 lambda_handler = handler

@@ -1,30 +1,30 @@
 """
 Enhanced Health Check for MCQ Scraper Lambda Function
-Provides comprehensive system status including browser availability
+FIXED: Chrome Binary Compatibility Check
 """
 
 import os
 import asyncio
 import logging
+import subprocess
 from datetime import datetime
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-class EnhancedHealthChecker:
-    """Enhanced health checker with browser status monitoring"""
+class ChromeBinaryHealthChecker:
+    """Health checker for Chrome binary approach"""
     
     def __init__(self):
         self.last_check_time = None
-        self.last_browser_status = None
         self.cached_health_data = None
     
     async def get_comprehensive_health_status(self) -> Dict[str, Any]:
-        """Get comprehensive health status including browser functionality"""
+        """Get comprehensive health status including Chrome binary functionality"""
         try:
             current_time = datetime.now()
             
-            # Cache health check for 30 seconds to avoid repeated browser tests
+            # Cache health check for 30 seconds
             if (self.cached_health_data and self.last_check_time and 
                 (current_time - self.last_check_time).total_seconds() < 30):
                 return self.cached_health_data
@@ -32,16 +32,16 @@ class EnhancedHealthChecker:
             # Basic system info
             health_data = {
                 "status": "healthy",
-                "version": "3.0.1",  # Updated version
+                "version": "3.0.2",  # Updated version for Chrome binary approach
                 "timestamp": current_time.isoformat(),
                 "environment": os.environ.get('ENVIRONMENT', 'unknown'),
-                "python_path": os.environ.get('PYTHONPATH', 'not_set'),
-                "browser_path": os.environ.get('PLAYWRIGHT_BROWSERS_PATH', 'not_set')
+                "approach": "chrome_binary_compatible",
+                "chrome_path": os.environ.get('CHROME_BINARY_PATH', 'not_set')
             }
             
-            # Check browser status
-            browser_status = await self._check_browser_status()
-            health_data["browser_status"] = browser_status
+            # Check Chrome binary status
+            chrome_status = await self._check_chrome_binary_status()
+            health_data["browser_status"] = chrome_status
             
             # Check S3 integration
             s3_status = self._check_s3_integration()
@@ -56,9 +56,9 @@ class EnhancedHealthChecker:
             health_data["job_storage"] = job_storage_status
             
             # Determine overall status
-            if not browser_status["installed"] or browser_status.get("test_failed", False):
+            if not chrome_status["installed"] or chrome_status.get("test_failed", False):
                 health_data["status"] = "degraded"
-                health_data["warnings"] = ["Browser functionality limited"]
+                health_data["warnings"] = ["Chrome binary functionality limited"]
             
             # Cache the result
             self.cached_health_data = health_data
@@ -70,117 +70,120 @@ class EnhancedHealthChecker:
             logger.error(f"Error in health check: {e}")
             return {
                 "status": "error",
-                "version": "3.0.1",
+                "version": "3.0.2",
+                "approach": "chrome_binary_compatible",
                 "error": str(e),
                 "timestamp": datetime.now().isoformat()
             }
     
-    async def _check_browser_status(self) -> Dict[str, Any]:
-        """Check Playwright browser installation and functionality"""
-        browser_status = {
+    async def _check_chrome_binary_status(self) -> Dict[str, Any]:
+        """Check Chrome binary installation and functionality"""
+        chrome_status = {
             "installed": False,
-            "installation_attempted": False,
+            "installation_attempted": True,
             "installation_error": None,
             "browser_pool_initialized": False,
             "test_passed": False,
             "test_error": None,
-            "executable_path": None
+            "chrome_version": None,
+            "binary_path": None
         }
         
         try:
-            # Check if browser directory exists
-            browser_path = os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '/opt/python/pw-browsers')
+            # Check if Chrome binary exists
+            chrome_path = os.environ.get('CHROME_BINARY_PATH', '/opt/chrome/chrome')
+            chrome_status["binary_path"] = chrome_path
             
-            if not os.path.exists(browser_path):
-                browser_status["installation_error"] = f"Browser directory not found: {browser_path}"
-                return browser_status
+            if not os.path.exists(chrome_path):
+                chrome_status["installation_error"] = f"Chrome binary not found: {chrome_path}"
+                return chrome_status
             
-            # Look for installed browsers
-            chromium_found = False
-            executable_path = None
+            if not os.access(chrome_path, os.X_OK):
+                chrome_status["installation_error"] = f"Chrome binary not executable: {chrome_path}"
+                return chrome_status
             
-            for item in os.listdir(browser_path):
-                if 'chromium' in item.lower():
-                    item_path = os.path.join(browser_path, item)
-                    if os.path.isdir(item_path):
-                        # Check for executables
-                        possible_executables = [
-                            os.path.join(item_path, 'chrome-linux', 'chrome'),
-                            os.path.join(item_path, 'chrome-linux', 'headless_shell'),
-                            os.path.join(item_path, 'chromium-linux', 'chrome'),
-                            os.path.join(item_path, 'chromium'),
-                            os.path.join(item_path, 'chrome')
-                        ]
-                        
-                        for exe_path in possible_executables:
-                            if os.path.exists(exe_path) and os.access(exe_path, os.X_OK):
-                                executable_path = exe_path
-                                chromium_found = True
-                                break
-                        
-                        if chromium_found:
-                            break
-            
-            if chromium_found:
-                browser_status["installed"] = True
-                browser_status["executable_path"] = executable_path
-                browser_status["browser_pool_initialized"] = True
+            # Test Chrome binary version
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.create_subprocess_exec(
+                        chrome_path, '--version',
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    ),
+                    timeout=10.0
+                )
                 
-                # Test browser functionality (with timeout)
-                try:
-                    test_result = await asyncio.wait_for(
-                        self._test_browser_functionality(executable_path),
-                        timeout=10.0
-                    )
-                    browser_status["test_passed"] = test_result
+                stdout, stderr = await result.communicate()
+                
+                if result.returncode == 0:
+                    chrome_version = stdout.decode().strip()
+                    chrome_status["installed"] = True
+                    chrome_status["chrome_version"] = chrome_version
+                    chrome_status["browser_pool_initialized"] = True
                     
-                except asyncio.TimeoutError:
-                    browser_status["test_error"] = "Browser test timeout"
-                    browser_status["test_failed"] = True
-                except Exception as e:
-                    browser_status["test_error"] = str(e)
-                    browser_status["test_failed"] = True
-            else:
-                browser_status["installation_error"] = "No Chromium executable found"
+                    # Test basic Chrome functionality
+                    try:
+                        test_result = await asyncio.wait_for(
+                            self._test_chrome_functionality(chrome_path),
+                            timeout=15.0
+                        )
+                        chrome_status["test_passed"] = test_result
+                        
+                    except asyncio.TimeoutError:
+                        chrome_status["test_error"] = "Chrome functionality test timeout"
+                        chrome_status["test_failed"] = True
+                    except Exception as e:
+                        chrome_status["test_error"] = str(e)
+                        chrome_status["test_failed"] = True
+                        
+                else:
+                    chrome_status["installation_error"] = f"Chrome version check failed: {stderr.decode()}"
+                    
+            except asyncio.TimeoutError:
+                chrome_status["installation_error"] = "Chrome binary test timeout"
+            except Exception as e:
+                chrome_status["installation_error"] = f"Chrome binary test error: {e}"
             
         except Exception as e:
-            browser_status["installation_error"] = f"Browser check failed: {e}"
+            chrome_status["installation_error"] = f"Chrome check failed: {e}"
         
-        return browser_status
+        return chrome_status
     
-    async def _test_browser_functionality(self, executable_path: str) -> bool:
-        """Test if browser can be launched and used"""
+    async def _test_chrome_functionality(self, chrome_path: str) -> bool:
+        """Test if Chrome binary can be used with Playwright"""
         try:
             from playwright.async_api import async_playwright
             
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
                     headless=True,
-                    executable_path=executable_path,
+                    executable_path=chrome_path,
                     args=[
                         '--no-sandbox',
                         '--disable-setuid-sandbox',
                         '--disable-dev-shm-usage',
-                        '--disable-gpu'
+                        '--disable-gpu',
+                        '--no-zygote',
+                        '--single-process',
+                        '--disable-web-security'
                     ]
                 )
                 
                 # Simple page test
                 page = await browser.new_page()
-                await page.goto('data:text/html,<h1>Health Check</h1>', timeout=5000)
+                await page.goto('data:text/html,<h1>Chrome Binary Test</h1>', timeout=10000)
                 title = await page.title()
                 await browser.close()
                 
                 return len(title) > 0
                 
         except Exception as e:
-            logger.error(f"Browser functionality test failed: {e}")
+            logger.error(f"Chrome functionality test failed: {e}")
             return False
     
     def _check_s3_integration(self) -> Dict[str, Any]:
         """Check S3 integration status"""
         try:
-            # Import S3 integration
             from s3_production_integration import LAMBDA_S3_INTEGRATION
             
             return {
@@ -237,7 +240,7 @@ class EnhancedHealthChecker:
             }
 
 # Global health checker instance
-health_checker = EnhancedHealthChecker()
+health_checker = ChromeBinaryHealthChecker()
 
 async def get_health_status() -> Dict[str, Any]:
     """Get comprehensive health status - async version"""
@@ -252,7 +255,8 @@ def get_health_status_sync() -> Dict[str, Any]:
         # Fallback for environments where async doesn't work
         return {
             "status": "healthy", 
-            "version": "3.0.1",
+            "version": "3.0.2",
+            "approach": "chrome_binary_compatible",
             "timestamp": datetime.now().isoformat(),
             "note": "Basic health check (async not available)"
         }
