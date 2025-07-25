@@ -1,0 +1,21 @@
+# Environment variables for MCQ Scraper
+AWS_REGION=us-east-1
+ENVIRONMENT=development
+SCRAPING_APPROACH=http_requests
+
+# Google Custom Search API Configuration
+SEARCH_ENGINE_ID=2701a7d64a00d47fd
+GOOGLE_API_KEY=
+API_KEY_POOL=
+
+# MongoDB Configuration
+MONGO_URL=mongodb://localhost:27017/mcq_scraper
+DB_NAME=mcq_scraper
+
+# S3 Configuration
+PDF_STORAGE_BUCKET=mcq-scraper-pdfs-default
+PDF_BUCKET_NAME=mcq-scraper-pdfs-default
+
+# Lambda Configuration
+AWS_LAMBDA_FUNCTION_NAME=mcq-scraper-backend
+AWS_ACCOUNT_ID=123456789012

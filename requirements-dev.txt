@@ -10,3 +10,5 @@ beautifulsoup4==4.12.3
 Pillow>=10.0.0
 python-multipart>=0.0.9
 setuptools
+aiohttp>=3.8.0
+aiofiles>=23.0.0
