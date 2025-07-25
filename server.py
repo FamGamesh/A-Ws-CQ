@@ -26,13 +26,14 @@ import aiohttp
 import aiofiles
 
 from reportlab.lib.pagesizes import letter, A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, Image as ReportLabImage
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 from reportlab.lib.colors import HexColor, black, darkblue, darkgreen, darkred, white, lightgrey
 from reportlab.graphics.shapes import Drawing, Rect, Line
 from reportlab.platypus.flowables import Flowable
+from reportlab.lib.utils import ImageReader
 
 # Import S3 integration for Lambda - PRODUCTION VERSION
 try:
@@ -581,6 +582,7 @@ class MCQData(BaseModel):
     exam_source_heading: str = ""
     exam_source_title: str = ""
     is_relevant: bool = True
+    screenshot: Optional[str] = None
 
 class JobStatus(BaseModel):
     job_id: str
@@ -789,12 +791,14 @@ class DecorativeSeparator(Flowable):
             canvas.circle(x_pos, y, diamond_size, fill=1)
 
 # PDF Generation - Enhanced for Lambda
-def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: int, irrelevant_mcqs: int, total_links: int) -> str:
+def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: int, irrelevant_mcqs: int, total_links: int, pdf_format: str = "text") -> str:
     """Generate BEAUTIFUL PROFESSIONAL PDF - Lambda compatible"""
+    temp_files_to_cleanup = []  # Track temporary files for cleanup
+    
     try:
         pdf_dir = get_pdf_directory()
         
-        filename = f"Testbook_MCQs_{topic.replace(' ', '_')}_{job_id}.pdf"
+        filename = f"Testbook_MCQs_{topic.replace(' ', '_')}_{job_id}_{pdf_format}.pdf"
         filepath = pdf_dir / filename
         
         doc = SimpleDocTemplate(str(filepath), pagesize=A4, 
@@ -992,26 +996,98 @@ def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: in
             
             story.append(Spacer(1, 0.1*inch))
             
-            # Question
-            if mcq.question:
-                question_text = mcq.question.replace('\n', '<br/>')
-                story.append(Paragraph(f"<b>QUESTION:</b><br/><br/>{question_text}", question_style))
+            # Handle PDF format - IMAGE vs TEXT
+            if pdf_format == "image":
+                # Try to add screenshot if available
+                screenshot_added = False
+                
+                # Check if MCQ has screenshot data
+                if hasattr(mcq, 'screenshot') and mcq.screenshot:
+                    try:
+                        # Decode base64 screenshot
+                        screenshot_data = base64.b64decode(mcq.screenshot)
+                        
+                        # Create image from screenshot data
+                        # Save image temporarily and create ReportLab image
+                        import tempfile
+                        import os
+                        
+                        # Create a temporary file for the image
+                        temp_fd, temp_image_path = tempfile.mkstemp(suffix='.png')
+                        temp_files_to_cleanup.append(temp_image_path)
+                        
+                        # Write the image data to the temporary file
+                        with os.fdopen(temp_fd, 'wb') as temp_file:
+                            temp_file.write(screenshot_data)
+                        
+                        # Add image to story with proper sizing
+                        img_width = 5*inch
+                        img_height = 3*inch
+                        
+                        screenshot_img = ReportLabImage(temp_image_path, width=img_width, height=img_height)
+                        story.append(screenshot_img)
+                        story.append(Spacer(1, 0.2*inch))
+                        
+                        screenshot_added = True
+                        
+                    except Exception as e:
+                        print(f"⚠️ Error adding screenshot for MCQ {i}: {e}")
+                        # Fall back to text format
+                        screenshot_added = False
+                
+                # If no screenshot or screenshot failed, fall back to text format
+                if not screenshot_added:
+                    # Add a note about image format
+                    story.append(Paragraph(f"<b>IMAGE FORMAT:</b> Original webpage screenshot", 
+                        ParagraphStyle('ImageNote', parent=styles['Normal'], 
+                            fontSize=10, textColor=accent_color, alignment=TA_CENTER, 
+                            fontName='Helvetica-Oblique', spaceAfter=10,
+                            borderWidth=1, borderColor=accent_color, borderPadding=5, 
+                            backColor=light_color)))
+                    
+                    # Add the text content as well for image format
+                    if mcq.question:
+                        question_text = mcq.question.replace('\n', '<br/>')
+                        story.append(Paragraph(f"<b>QUESTION:</b><br/><br/>{question_text}", question_style))
+                    
+                    story.append(Spacer(1, 0.15*inch))
+                    
+                    # Options
+                    if mcq.options:
+                        for j, option in enumerate(mcq.options, 1):
+                            option_letter = chr(64 + j)
+                            option_text = option.replace('\n', '<br/>')
+                            story.append(Paragraph(f"<b>{option_letter})</b> {option_text}", option_style))
+                    
+                    story.append(Spacer(1, 0.15*inch))
+                    
+                    # Answer
+                    if mcq.answer:
+                        answer_text = mcq.answer.replace('\n', '<br/>')
+                        story.append(Paragraph(f"<b>CORRECT ANSWER & EXPLANATION:</b><br/><br/>{answer_text}", answer_style))
             
-            story.append(Spacer(1, 0.15*inch))
-            
-            # Options
-            if mcq.options:
-                for j, option in enumerate(mcq.options, 1):
-                    option_letter = chr(64 + j)
-                    option_text = option.replace('\n', '<br/>')
-                    story.append(Paragraph(f"<b>{option_letter})</b> {option_text}", option_style))
-            
-            story.append(Spacer(1, 0.15*inch))
-            
-            # Answer
-            if mcq.answer:
-                answer_text = mcq.answer.replace('\n', '<br/>')
-                story.append(Paragraph(f"<b>CORRECT ANSWER & EXPLANATION:</b><br/><br/>{answer_text}", answer_style))
+            else:
+                # TEXT FORMAT (original logic)
+                # Question
+                if mcq.question:
+                    question_text = mcq.question.replace('\n', '<br/>')
+                    story.append(Paragraph(f"<b>QUESTION:</b><br/><br/>{question_text}", question_style))
+                
+                story.append(Spacer(1, 0.15*inch))
+                
+                # Options
+                if mcq.options:
+                    for j, option in enumerate(mcq.options, 1):
+                        option_letter = chr(64 + j)
+                        option_text = option.replace('\n', '<br/>')
+                        story.append(Paragraph(f"<b>{option_letter})</b> {option_text}", option_style))
+                
+                story.append(Spacer(1, 0.15*inch))
+                
+                # Answer
+                if mcq.answer:
+                    answer_text = mcq.answer.replace('\n', '<br/>')
+                    story.append(Paragraph(f"<b>CORRECT ANSWER & EXPLANATION:</b><br/><br/>{answer_text}", answer_style))
             
             # Separator between questions
             if i < len(mcqs):
@@ -1040,10 +1116,26 @@ def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: in
         # Build PDF
         doc.build(story)
         
+        # Clean up temporary files
+        for temp_file in temp_files_to_cleanup:
+            try:
+                import os
+                os.unlink(temp_file)
+            except:
+                pass
+        
         print(f"✅ BEAUTIFUL PROFESSIONAL PDF generated successfully: {filename} with {len(mcqs)} MCQs")
         return filename
         
     except Exception as e:
+        # Clean up temporary files in case of error
+        for temp_file in temp_files_to_cleanup:
+            try:
+                import os
+                os.unlink(temp_file)
+            except:
+                pass
+        
         print(f"❌ Error generating beautiful PDF: {e}")
         raise
 
@@ -1129,11 +1221,12 @@ async def process_concurrent_extraction(job_id: str, topic: str, exam_type: str,
                         answer=result.get('answer', ''),
                         exam_source_heading=result.get('exam_source_heading', ''),
                         exam_source_title=result.get('exam_source_title', ''),
-                        is_relevant=result.get('is_relevant', True)
+                        is_relevant=result.get('is_relevant', True),
+                        screenshot=result.get('screenshot', None)
                     )
                     mcqs.append(mcq)
             
-            filename = generate_pdf(mcqs, topic, job_id, len(all_results), 0, len(links))
+            filename = generate_pdf(mcqs, topic, job_id, len(all_results), 0, len(links), pdf_format)
             
             # Handle S3 upload for Lambda
             if LAMBDA_S3_INTEGRATION:
