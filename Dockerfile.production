@@ -31,16 +31,11 @@ COPY s3_production_integration.py ./
 # Set proper executable permissions  
 RUN chmod +x lambda_handler_production.py
 
-# Create verification script
-RUN echo '#!/bin/bash\n\
-echo "=== HTTP Scraping Solution Verification ==="\n\
-python3 -c "import requests; print(f\"Requests: {requests.__version__}\")"\n\
-python3 -c "import beautifulsoup4; print(\"BeautifulSoup: Available\")"\n\
-echo "=== Verification Complete ==="' > /opt/verify_http.sh && \
-    chmod +x /opt/verify_http.sh
-
-# Run verification during build
-RUN /opt/verify_http.sh
+# Create and run verification directly (fixed script issue)
+RUN echo "=== HTTP Scraping Solution Verification ===" && \
+    python3 -c "import requests; print('Requests:', requests.__version__)" && \
+    python3 -c "from bs4 import BeautifulSoup; print('BeautifulSoup: Available')" && \
+    echo "=== Verification Complete ==="
 
 # Set the Lambda handler
 CMD ["lambda_handler_production.handler"]
