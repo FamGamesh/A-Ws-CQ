@@ -1,0 +1,34 @@
+{
+  "Version": "2012-10-17",
+  "Id": "default",
+  "Statement": [
+    {
+      "Sid": "AllowAPIGatewayInvoke",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "apigateway.amazonaws.com"
+      },
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:*:*:function:mcq-scraper-backend",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceAccount": "${AWS::AccountId}"
+        }
+      }
+    },
+    {
+      "Sid": "AllowAPIGatewayInvokeSpecific",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "apigateway.amazonaws.com"
+      },
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:*:*:function:mcq-scraper-backend",
+      "Condition": {
+        "ArnLike": {
+          "aws:SourceArn": "arn:aws:execute-api:*:*:*/*/*"
+        }
+      }
+    }
+  ]
+}
