@@ -7,13 +7,16 @@ from dotenv import load_dotenv
 import requests
 import asyncio
 import json
-from playwright.async_api import async_playwright, Browser, BrowserContext
-import subprocess
-import sys
+from typing import List, Dict, Optional
+import uuid
+from datetime import datetime, timedelta
+import re
+from pathlib import Path
+import logging
+import pickle
+import hashlib
+from bs4 import BeautifulSoup
 import time
-import threading
-import signal
-import atexit
 
 from reportlab.lib.pagesizes import letter, A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
@@ -23,14 +26,6 @@ from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
 from reportlab.lib.colors import HexColor, black, darkblue, darkgreen, darkred, white, lightgrey
 from reportlab.graphics.shapes import Drawing, Rect, Line
 from reportlab.platypus.flowables import Flowable
-from typing import List, Dict, Optional
-import uuid
-from datetime import datetime, timedelta
-import re
-from pathlib import Path
-import logging
-import pickle
-import hashlib
 
 # Import S3 integration for Lambda - PRODUCTION VERSION
 try:
@@ -47,7 +42,6 @@ except ImportError:
         
         def get_pdf_directory() -> Path:
             """Environment-aware PDF directory configuration."""
-            # Check for common cloud environment indicators
             cloud_env_indicators = [
                 'DYNO', 'RENDER', 'VERCEL', 'RAILWAY_ENVIRONMENT', 
                 'GOOGLE_CLOUD_PROJECT', 'AWS_LAMBDA_FUNCTION_NAME', 
@@ -57,7 +51,6 @@ except ImportError:
             is_cloud_environment = any(os.getenv(indicator) for indicator in cloud_env_indicators)
             is_container = os.path.exists('/.dockerenv') or os.path.exists('/proc/1/cgroup')
             
-            # Test if /app directory is writable
             app_dir_writable = False
             try:
                 test_file = Path("/app/.write_test")
@@ -67,7 +60,6 @@ except ImportError:
             except (PermissionError, OSError):
                 app_dir_writable = False
             
-            # Determine appropriate directory
             if is_cloud_environment or is_container or not app_dir_writable:
                 pdf_dir = Path("/tmp/pdfs")
                 print(f"🌤️  Using cloud-compatible PDF directory: {pdf_dir}")
@@ -75,7 +67,6 @@ except ImportError:
                 pdf_dir = Path("/app/pdfs")
                 print(f"🏠 Using development PDF directory: {pdf_dir}")
             
-            # Ensure directory exists
             try:
                 pdf_dir.mkdir(parents=True, exist_ok=True)
                 print(f"✅ PDF directory ready: {pdf_dir}")
@@ -98,256 +89,279 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# CHROME BINARY BROWSER MANAGER - Complete Lambda Solution
-class ChromeBinaryBrowserManager:
+# HTTP SCRAPING MANAGER - Lambda Compatible Solution
+class HTTPScrapingManager:
     """
-    Complete Chrome Binary Browser Manager for AWS Lambda
-    Eliminates all GLIBC compatibility issues
+    HTTP-based scraping manager - No browser required
+    Perfect for AWS Lambda environments
     """
     
     def __init__(self):
-        self.browser: Optional[Browser] = None
-        self.playwright_instance = None
+        self.session = None
         self.is_initialized = False
-        self.lock = asyncio.Lock()
-        self.retry_count = 0
-        self.max_retries = 3
-        self.last_error = None
-        self.chrome_path = None
+        self.scraping_stats = {
+            "requests_made": 0,
+            "successful_scrapes": 0,
+            "failed_scrapes": 0
+        }
         
-    def _detect_browser_approach(self):
-        """Detect if we should use Chrome binary approach"""
-        approach = os.environ.get('BROWSER_APPROACH', 'auto')
-        chrome_path = os.environ.get('CHROME_BINARY_PATH', '/opt/chrome/chrome')
-        
-        if approach == 'chrome_binary' or os.path.exists(chrome_path):
-            return 'chrome_binary'
-        else:
-            return 'playwright_default'
-    
-    async def initialize(self):
-        """Initialize browser with Chrome binary approach"""
-        async with self.lock:
-            if self.is_initialized and self.browser:
-                try:
-                    # Test if browser is still alive
-                    if self.browser.is_connected():
-                        return
-                except:
-                    pass
-                
-                print("⚠️ Browser connection lost, reinitializing...")
-                await self._cleanup()
-                self.is_initialized = False
+    def initialize(self):
+        """Initialize HTTP session with optimal settings"""
+        if self.is_initialized:
+            return
             
-            if self.is_initialized:
-                return
-            
-            approach = self._detect_browser_approach()
-            print(f"🚀 Initializing Chrome Binary Browser Manager (approach: {approach})...")
-            
-            if approach == 'chrome_binary':
-                await self._initialize_chrome_binary()
-            else:
-                print("⚠️ Chrome binary not available, browser features disabled")
-                self.is_initialized = False
-                return
-    
-    async def _initialize_chrome_binary(self):
-        """Initialize using Chrome binary"""
         try:
-            self.chrome_path = os.environ.get('CHROME_BINARY_PATH', '/opt/chrome/chrome')
+            self.session = requests.Session()
             
-            if not os.path.exists(self.chrome_path):
-                raise Exception(f"Chrome binary not found: {self.chrome_path}")
+            # Optimize session for scraping
+            self.session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            })
             
-            self.playwright_instance = await async_playwright().start()
-            
-            # Lambda-optimized Chrome arguments
-            chrome_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--disable-gpu',
-                '--disable-gpu-sandbox',
-                '--disable-software-rasterizer',
-                '--no-first-run',
-                '--no-zygote',
-                '--single-process',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-web-security',
-                '--disable-features=VizDisplayCompositor',
-                '--disable-extensions',
-                '--disable-plugins',
-                '--disable-images',
-                '--disable-javascript',
-                '--disable-default-apps',
-                '--disable-background-networking',
-                '--disable-sync',
-                '--no-default-browser-check',
-                '--memory-pressure-off',
-                '--max_old_space_size=256',
-                '--aggressive-cache-discard',
-                '--disable-hang-monitor',
-                '--disable-prompt-on-repost',
-                '--disable-client-side-phishing-detection',
-                '--disable-component-extensions-with-background-pages',
-                '--disable-component-update',
-                '--disable-breakpad',
-                '--disable-back-forward-cache',
-                '--disable-field-trial-config',
-                '--disable-ipc-flooding-protection',
-                '--disable-popup-blocking',
-                '--force-color-profile=srgb',
-                '--metrics-recording-only',
-                '--password-store=basic',
-                '--use-mock-keychain',
-                '--no-service-autorun',
-                '--export-tagged-pdf',
-                '--disable-search-engine-choice-screen',
-                '--unsafely-disable-devtools-self-xss-warnings',
-                '--enable-automation',
-                '--headless',
-                '--hide-scrollbars',
-                '--mute-audio'
-            ]
-            
-            self.browser = await self.playwright_instance.chromium.launch(
-                headless=True,
-                executable_path=self.chrome_path,
-                args=chrome_args,
-                timeout=30000
+            # Configure session for reliability
+            adapter = requests.adapters.HTTPAdapter(
+                max_retries=requests.adapters.Retry(
+                    total=3,
+                    backoff_factor=1,
+                    status_forcelist=[502, 503, 504, 429]
+                )
             )
             
-            # Test browser with a simple operation
-            test_context = await self.browser.new_context()
-            test_page = await test_context.new_page()
-            await test_page.goto('data:text/html,<h1>Test</h1>', timeout=5000)
-            await test_page.close()
-            await test_context.close()
+            self.session.mount('http://', adapter)
+            self.session.mount('https://', adapter)
             
             self.is_initialized = True
-            self.retry_count = 0
-            
-            print(f"✅ Chrome Binary Browser Manager initialized successfully!")
-            print(f"   Chrome binary: {self.chrome_path}")
+            print("✅ HTTP Scraping Manager initialized successfully")
             
         except Exception as e:
-            print(f"❌ Chrome Binary Browser initialization failed: {e}")
-            self.last_error = str(e)
-            await self._cleanup()
-            raise Exception(f"Failed to initialize Chrome Binary Browser: {e}")
+            print(f"❌ Error initializing HTTP Scraping Manager: {e}")
+            raise
     
-    async def get_context(self) -> BrowserContext:
-        """Get browser context with Chrome binary"""
-        max_attempts = 3
-        
-        for attempt in range(max_attempts):
+    async def scrape_mcq_page(self, url: str, topic: str, exam_type: str = "SSC") -> Optional[dict]:
+        """Scrape MCQ page using HTTP requests and BeautifulSoup"""
+        try:
+            if not self.is_initialized:
+                self.initialize()
+            
+            print(f"🔍 HTTP scraping: {url}")
+            self.scraping_stats["requests_made"] += 1
+            
+            # Fetch page content
+            response = self.session.get(url, timeout=15)
+            response.raise_for_status()
+            
+            # Parse HTML content
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Extract MCQ data using CSS selectors
+            mcq_data = self._extract_mcq_from_soup(soup, url, topic, exam_type)
+            
+            if mcq_data:
+                self.scraping_stats["successful_scrapes"] += 1
+                print(f"✅ Successfully scraped MCQ from {url}")
+                return mcq_data
+            else:
+                self.scraping_stats["failed_scrapes"] += 1
+                print(f"❌ No MCQ data found on {url}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            print(f"⏱️ Timeout scraping {url}")
+            self.scraping_stats["failed_scrapes"] += 1
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Request error scraping {url}: {e}")
+            self.scraping_stats["failed_scrapes"] += 1
+            return None
+        except Exception as e:
+            print(f"❌ Error scraping {url}: {e}")
+            self.scraping_stats["failed_scrapes"] += 1
+            return None
+    
+    def _extract_mcq_from_soup(self, soup: BeautifulSoup, url: str, topic: str, exam_type: str) -> Optional[dict]:
+        """Extract MCQ data from parsed HTML"""
+        try:
+            # Extract question
+            question = ""
+            question_selectors = [
+                'h1.questionBody.tag-h1',
+                'div.questionBody', 
+                'h1.question',
+                '.question-text',
+                '[class*="question"]'
+            ]
+            
+            for selector in question_selectors:
+                question_elem = soup.select_one(selector)
+                if question_elem:
+                    question = self._clean_text(question_elem.get_text())
+                    break
+            
+            if not question or len(question.strip()) < 10:
+                print(f"❌ No valid question found on {url}")
+                return None
+            
+            # Check topic relevance
+            if not self._is_topic_relevant(question, topic):
+                print(f"❌ Question not relevant for topic '{topic}' on {url}")
+                return None
+            
+            # Extract options
+            options = []
+            option_selectors = [
+                'li.option',
+                '.option',
+                '[class*="option"]',
+                'ul li'
+            ]
+            
+            for selector in option_selectors:
+                option_elements = soup.select(selector)
+                if option_elements:
+                    for elem in option_elements:
+                        option_text = self._clean_text(elem.get_text())
+                        if option_text and len(option_text.strip()) > 0:
+                            options.append(option_text)
+                    break
+            
+            # Extract answer/solution
+            answer = ""
+            answer_selectors = [
+                '.solution',
+                '.answer',
+                '[class*="solution"]',
+                '[class*="answer"]'
+            ]
+            
+            for selector in answer_selectors:
+                answer_elem = soup.select_one(selector)
+                if answer_elem:
+                    answer = self._clean_text(answer_elem.get_text())
+                    break
+            
+            # Extract exam source information
+            exam_source_heading = ""
+            exam_source_title = ""
+            
             try:
-                # Ensure browser is ready
-                await self.initialize()
+                heading_elem = soup.select_one('div.pyp-heading')
+                if heading_elem:
+                    exam_source_heading = self._clean_text(heading_elem.get_text())
                 
-                if not self.is_initialized or not self.browser:
-                    raise Exception("Browser not initialized")
-                
-                # Create context with optimized settings
-                context = await asyncio.wait_for(
-                    self.browser.new_context(
-                        user_agent='Mozilla/5.0 (Linux; x86_64) Chrome/57.0.2987.133',
-                        viewport={'width': 1280, 'height': 720},
-                        ignore_https_errors=True,
-                        java_script_enabled=False,
-                        extra_http_headers={'Accept-Language': 'en-US,en;q=0.9'},
-                        bypass_csp=True
-                    ),
-                    timeout=15.0
-                )
-                
-                print(f"✅ Browser context created successfully (Chrome Binary)")
-                return context
-                
-            except asyncio.TimeoutError:
-                print(f"⏱️ Context creation timeout (attempt {attempt + 1})")
-                await self._handle_browser_failure()
-                
+                title_elem = soup.select_one('div.pyp-title.line-ellipsis')
+                if title_elem:
+                    exam_source_title = self._clean_text(title_elem.get_text())
             except Exception as e:
-                print(f"⚠️ Error creating context (attempt {attempt + 1}): {e}")
-                await self._handle_browser_failure()
+                print(f"⚠️ Error extracting exam source: {e}")
+            
+            # Check exam type relevance
+            if not self._is_exam_type_relevant(exam_source_heading, exam_source_title, exam_type):
+                print(f"❌ MCQ not relevant for exam type '{exam_type}' on {url}")
+                return None
+            
+            # Return MCQ data if we have at least question and some content
+            if question and (options or answer):
+                return {
+                    "url": url,
+                    "question": question,
+                    "options": options,
+                    "answer": answer,
+                    "exam_source_heading": exam_source_heading,
+                    "exam_source_title": exam_source_title,
+                    "is_relevant": True,
+                    "scraping_method": "http_requests"
+                }
+            else:
+                print(f"❌ Insufficient MCQ data extracted from {url}")
+                return None
                 
-                if attempt == max_attempts - 1:
-                    print("🚨 Maximum attempts reached for context creation")
-                    raise Exception("Failed to create browser context after all attempts")
-            
-            # Progressive backoff
-            wait_time = min(2 + attempt, 6)
-            print(f"⏳ Waiting {wait_time}s before retry...")
-            await asyncio.sleep(wait_time)
-        
-        raise Exception("Failed to create browser context")
-    
-    async def _handle_browser_failure(self):
-        """Handle browser failures with cleanup"""
-        print("🔧 Handling browser failure...")
-        await self._cleanup()
-        self.retry_count += 1
-        
-        # Force garbage collection
-        import gc
-        gc.collect()
-    
-    async def _cleanup(self):
-        """Enhanced cleanup"""
-        cleanup_tasks = []
-        
-        try:
-            if self.browser:
-                cleanup_tasks.append(self._safe_close_browser())
-            
-            if self.playwright_instance:
-                cleanup_tasks.append(self._safe_stop_playwright())
-            
-            if cleanup_tasks:
-                await asyncio.wait_for(
-                    asyncio.gather(*cleanup_tasks, return_exceptions=True),
-                    timeout=10.0
-                )
-                
-        except asyncio.TimeoutError:
-            print("⏱️ Cleanup timeout")
         except Exception as e:
-            print(f"⚠️ Error during cleanup: {e}")
-        finally:
-            self.browser = None
-            self.playwright_instance = None
-            self.is_initialized = False
+            print(f"❌ Error extracting MCQ data from {url}: {e}")
+            return None
     
-    async def _safe_close_browser(self):
-        """Safely close browser"""
+    def _clean_text(self, text: str) -> str:
+        """Clean extracted text"""
+        if not text:
+            return ""
+        
+        # Remove extra whitespace and clean up
+        text = ' '.join(text.split())
+        
+        # Remove common unwanted patterns
+        unwanted_patterns = [
+            r'\s*\n\s*',
+            r'\s*\r\s*',
+            r'\s*\t\s*',
+            r'^\s*[-•]\s*',  # Remove bullet points
+            r'\s+',  # Multiple spaces
+        ]
+        
+        for pattern in unwanted_patterns:
+            text = re.sub(pattern, ' ', text)
+        
+        return text.strip()
+    
+    def _is_topic_relevant(self, question: str, topic: str) -> bool:
+        """Check if question is relevant to the topic"""
         try:
-            if self.browser:
-                await asyncio.wait_for(self.browser.close(), timeout=5.0)
-        except:
-            pass
+            from competitive_exam_keywords import enhanced_is_mcq_relevant
+            return enhanced_is_mcq_relevant(question, topic)
+        except ImportError:
+            # Fallback simple relevance check
+            question_lower = question.lower()
+            topic_lower = topic.lower()
+            
+            # Split topic into words for flexible matching
+            topic_words = topic_lower.split()
+            
+            # Check if any topic words appear in question
+            for word in topic_words:
+                if len(word) > 2 and word in question_lower:
+                    return True
+            
+            return False
     
-    async def _safe_stop_playwright(self):
-        """Safely stop playwright"""
-        try:
-            if self.playwright_instance:
-                await asyncio.wait_for(self.playwright_instance.stop(), timeout=5.0)
-        except:
-            pass
+    def _is_exam_type_relevant(self, heading: str, title: str, exam_type: str) -> bool:
+        """Check if MCQ is relevant for the specified exam type"""
+        exam_text = f"{heading} {title}".lower()
+        exam_type_lower = exam_type.lower()
+        
+        # Define exam type keywords
+        exam_keywords = {
+            "ssc": ["ssc", "staff selection commission", "ssc cgl", "ssc chsl", "ssc mts", "ssc je"],
+            "bpsc": ["bpsc", "bihar public service commission", "bpsc combined", "bpsc prelims"],
+            "upsc": ["upsc", "union public service commission", "civil services", "ias", "ips"],
+            "railway": ["railway", "rrb", "railway recruitment board", "ntpc", "group d"],
+            "banking": ["bank", "banking", "ibps", "sbi", "rbi", "nabard"]
+        }
+        
+        # Get keywords for the specified exam type
+        relevant_keywords = exam_keywords.get(exam_type_lower, [exam_type_lower])
+        
+        # Check if any relevant keywords are present
+        for keyword in relevant_keywords:
+            if keyword in exam_text:
+                return True
+        
+        return False
     
-    async def close(self):
-        """Close browser manager"""
-        print("🔫 Closing Chrome Binary Browser Manager...")
-        await self._cleanup()
-        print("✅ Chrome Binary Browser Manager closed")
+    def get_stats(self) -> dict:
+        """Get scraping statistics"""
+        return {
+            "initialized": self.is_initialized,
+            "scraping_stats": self.scraping_stats,
+            "success_rate": (
+                self.scraping_stats["successful_scrapes"] / max(self.scraping_stats["requests_made"], 1) * 100
+            )
+        }
 
-# Global Chrome binary browser manager
-browser_pool = ChromeBinaryBrowserManager()
+# Global HTTP scraping manager
+http_scraper = HTTPScrapingManager()
 
 # PERSISTENT JOB STORAGE
 class PersistentJobStorage:
@@ -452,19 +466,15 @@ class APIKeyManager:
     def _load_api_keys(self):
         """Load API keys from environment"""
         try:
-            # Load from API_KEY_POOL environment variable
             api_key_pool = os.environ.get('API_KEY_POOL', '')
             if api_key_pool:
                 self.api_keys.extend([key.strip() for key in api_key_pool.split(',') if key.strip()])
             
-            # Load individual Google API key
             google_api_key = os.environ.get('GOOGLE_API_KEY', '')
             if google_api_key:
                 self.api_keys.append(google_api_key.strip())
             
-            # Remove duplicates
             self.api_keys = list(set(self.api_keys))
-            
             print(f"🔑 Initialized API Key Manager with {len(self.api_keys)} keys")
             
         except Exception as e:
@@ -475,7 +485,6 @@ class APIKeyManager:
         """Get current API key"""
         if not self.api_keys:
             raise Exception("No API keys available")
-        
         return self.api_keys[self.current_key_index]
     
     def rotate_key(self) -> Optional[str]:
@@ -486,7 +495,6 @@ class APIKeyManager:
         self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
         
         if self.current_key_index == 0:
-            # We've cycled through all keys
             return None
         
         return self.api_keys[self.current_key_index]
@@ -502,7 +510,7 @@ api_key_manager = APIKeyManager()
 SEARCH_ENGINE_ID = os.environ.get('SEARCH_ENGINE_ID', '2701a7d64a00d47fd')
 
 # FastAPI App Configuration
-app = FastAPI(title="MCQ Scraper API", version="3.0.3")
+app = FastAPI(title="MCQ Scraper API", version="4.0.0")
 
 # CORS Configuration
 app.add_middleware(
@@ -549,29 +557,27 @@ async def read_root():
     """Root endpoint"""
     return {
         "message": "MCQ Scraper API", 
-        "version": "3.0.3",
-        "approach": "chrome_binary_complete",
+        "version": "4.0.0",
+        "approach": "http_requests_scraping",
+        "browser_required": False,
         "status": "running"
     }
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint with Chrome binary status"""
+    """Health check endpoint with HTTP scraping status"""
     try:
         from health_check import get_health_status
         return await get_health_status()
     except Exception as e:
         return {
             "status": "error",
-            "version": "3.0.3",
-            "approach": "chrome_binary_complete",
+            "version": "4.0.0",
+            "approach": "http_requests_scraping",
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
 
-# Additional endpoint implementations would continue here...
-# (The rest of the server.py endpoints remain the same but would be too long for this response)
-
 print("============================================================")
-print("MCQ SCRAPER - CHROME BINARY COMPLETE VERSION")
+print("MCQ SCRAPER - HTTP SCRAPING FINAL VERSION")
 print("============================================================")

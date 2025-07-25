@@ -1,6 +1,6 @@
 """
 Production Lambda Handler for MCQ Scraper
-COMPLETE CHROME BINARY SOLUTION - All issues addressed
+FINAL SOLUTION: HTTP-based scraping (No browser required)
 """
 
 import os
@@ -8,7 +8,6 @@ import json
 import boto3
 import logging
 import traceback
-import subprocess
 from mangum import Mangum
 from typing import Dict, Any
 
@@ -19,8 +18,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class CompleteChromeBinaryLambdaHandler:
-    """Complete Chrome Binary Lambda handler - all compatibility issues resolved"""
+class HTTPScrapingLambdaHandler:
+    """HTTP-based scraping Lambda handler - Browser-free solution"""
     
     def __init__(self):
         self.s3_client = None
@@ -28,30 +27,25 @@ class CompleteChromeBinaryLambdaHandler:
         self.app = None
         self.mangum_handler = None
         self.initialized = False
-        self.browser_status = {
-            "installed": False,
-            "installation_attempted": False,
-            "installation_error": None,
-            "browser_pool_initialized": False,
-            "chrome_version": None,
-            "approach": "chrome_binary_complete"
+        self.scraping_status = {
+            "approach": "http_requests",
+            "browser_required": False,
+            "http_client_ready": False,
+            "beautifulsoup_available": False
         }
     
     def initialize(self):
-        """Initialize Lambda environment with complete Chrome binary setup"""
+        """Initialize Lambda environment for HTTP scraping"""
         if self.initialized:
             return
             
         try:
-            logger.info("🚀 Initializing Complete Chrome Binary Lambda Handler...")
+            logger.info("🚀 Initializing HTTP Scraping Lambda Handler...")
             
-            # Set Chrome-specific environment variables  
-            os.environ['CHROME_BINARY_PATH'] = '/opt/chrome/chrome'
-            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/opt/chrome'
-            os.environ['PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD'] = '1'
+            # Set HTTP scraping environment variables  
+            os.environ['SCRAPING_APPROACH'] = 'http_requests'
             os.environ['ENVIRONMENT'] = 'lambda'
             os.environ['PYTHONPATH'] = '/opt/python:/var/task'
-            os.environ['BROWSER_APPROACH'] = 'chrome_binary'
             
             # Initialize AWS clients
             self.s3_client = boto3.client('s3')
@@ -60,8 +54,8 @@ class CompleteChromeBinaryLambdaHandler:
             # Load secrets
             self._load_secrets()
             
-            # CRITICAL: Initialize Chrome binary environment FIRST
-            self._initialize_chrome_binary_environment()
+            # Verify HTTP scraping capabilities
+            self._verify_http_scraping()
             
             # Import and initialize FastAPI app
             from server import app
@@ -69,67 +63,42 @@ class CompleteChromeBinaryLambdaHandler:
             self.mangum_handler = Mangum(app, lifespan="off")
             
             self.initialized = True
-            logger.info("✅ Complete Chrome Binary Lambda handler initialized successfully")
+            logger.info("✅ HTTP Scraping Lambda handler initialized successfully")
             
         except Exception as e:
             logger.error(f"❌ Error initializing Lambda handler: {e}")
             logger.error(traceback.format_exc())
             raise
     
-    def _initialize_chrome_binary_environment(self):
-        """Initialize Chrome binary with all compatibility fixes"""
+    def _verify_http_scraping(self):
+        """Verify HTTP scraping capabilities"""
         try:
-            logger.info("🔧 Initializing Chrome binary environment (complete solution)...")
+            logger.info("🔧 Verifying HTTP scraping capabilities...")
             
-            self.browser_status["installation_attempted"] = True
-            
-            # Verify Chrome binary exists
-            chrome_path = '/opt/chrome/chrome'
-            
-            if not os.path.exists(chrome_path):
-                raise Exception(f"Chrome binary not found at {chrome_path}")
-            
-            # Fix permissions if needed
-            if not os.access(chrome_path, os.X_OK):
-                import stat
-                os.chmod(chrome_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-                logger.info("🔧 Fixed Chrome binary permissions")
-            
-            # Test Chrome binary with Lambda-compatible arguments
+            # Test requests library
             try:
-                cmd = [chrome_path, '--version', '--no-sandbox', '--disable-gpu']
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                
-                if result.returncode == 0:
-                    chrome_version = result.stdout.strip()
-                    logger.info(f"✅ Chrome binary verified: {chrome_version}")
-                    self.browser_status["chrome_version"] = chrome_version
-                    self.browser_status["installed"] = True
-                    self.browser_status["browser_pool_initialized"] = True
-                    
-                    # Set for application use
-                    os.environ['BROWSER_EXECUTABLE_PATH'] = chrome_path
-                    
-                else:
-                    error_output = result.stderr.strip() if result.stderr else "Unknown error"
-                    raise Exception(f"Chrome version check failed: {error_output}")
-                    
-            except subprocess.TimeoutExpired:
-                raise Exception("Chrome binary test timeout")
-            except Exception as e:
-                raise Exception(f"Chrome binary test failed: {e}")
+                import requests
+                self.scraping_status["http_client_ready"] = True
+                logger.info(f"✅ Requests library available: {requests.__version__}")
+            except ImportError as e:
+                logger.error(f"❌ Requests library not available: {e}")
+                raise Exception("Requests library required for HTTP scraping")
             
-            logger.info("✅ Chrome binary environment initialized successfully")
+            # Test BeautifulSoup
+            try:
+                import bs4
+                self.scraping_status["beautifulsoup_available"] = True  
+                logger.info(f"✅ BeautifulSoup available: {bs4.__version__}")
+            except ImportError as e:
+                logger.error(f"❌ BeautifulSoup not available: {e}")
+                raise Exception("BeautifulSoup required for HTML parsing")
+            
+            logger.info("✅ HTTP scraping environment verified successfully")
                 
         except Exception as e:
-            error_msg = f"Chrome binary initialization failed: {e}"
+            error_msg = f"HTTP scraping verification failed: {e}"
             logger.error(f"❌ {error_msg}")
-            self.browser_status["installation_error"] = error_msg
-            self.browser_status["installed"] = False
-            self.browser_status["browser_pool_initialized"] = False
-            
-            # Continue execution - app can handle degraded mode
-            logger.warning("⚠️ Continuing in degraded mode without Chrome binary")
+            raise Exception(error_msg)
     
     def _load_secrets(self):
         """Load secrets from AWS Secrets Manager"""
@@ -174,7 +143,7 @@ class CompleteChromeBinaryLambdaHandler:
             logger.error(f"❌ Error loading secrets: {e}")
     
     def handle_request(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-        """Handle Lambda request with complete error handling"""
+        """Handle Lambda request with comprehensive error handling"""
         try:
             # Ensure initialization
             if not self.initialized:
@@ -191,8 +160,11 @@ class CompleteChromeBinaryLambdaHandler:
             if method == 'OPTIONS':
                 return self._create_cors_response(200, '')
             
+            # Fix event format for Mangum compatibility
+            fixed_event = self._fix_event_format(event)
+            
             # Process through Mangum
-            response = self.mangum_handler(event, context)
+            response = self.mangum_handler(fixed_event, context)
             
             # Ensure CORS headers
             if 'headers' not in response:
@@ -212,42 +184,54 @@ class CompleteChromeBinaryLambdaHandler:
                 'error': 'Internal server error',
                 'message': str(e),
                 'type': 'lambda_handler_error',
-                'browser_status': self.browser_status,
+                'scraping_status': self.scraping_status,
                 'event_type': self._detect_event_type(event)
             })
     
+    def _fix_event_format(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Fix event format for Mangum compatibility"""
+        fixed_event = event.copy()
+        
+        # Ensure requestContext has all required fields
+        if 'requestContext' in fixed_event:
+            request_context = fixed_event['requestContext']
+            
+            # Add missing sourceIp if not present
+            if 'http' in request_context and 'sourceIp' not in request_context['http']:
+                request_context['http']['sourceIp'] = '127.0.0.1'
+            
+            # Add missing fields for API Gateway HTTP format
+            if 'domainName' not in request_context:
+                request_context['domainName'] = 'lambda-url.amazonaws.com'
+            
+            if 'requestId' not in request_context:
+                request_context['requestId'] = 'lambda-test-request'
+                
+            if 'accountId' not in request_context:
+                request_context['accountId'] = '123456789012'
+        
+        return fixed_event
+    
     def _extract_method(self, event: Dict[str, Any]) -> str:
         """Extract HTTP method from various event formats"""
-        # API Gateway REST API format
         if 'httpMethod' in event:
             return event['httpMethod']
         
-        # API Gateway HTTP API format
         if 'requestContext' in event and 'http' in event['requestContext']:
-            return event['requestContext']['http'].get('method', 'UNKNOWN')
+            return event['requestContext']['http'].get('method', 'GET')
         
-        # Lambda Function URL format
-        if 'requestContext' in event and 'httpMethod' in event['requestContext']:
-            return event['requestContext']['httpMethod']
-        
-        return 'UNKNOWN'
+        return 'GET'
     
     def _extract_path(self, event: Dict[str, Any]) -> str:
         """Extract path from various event formats"""
-        # Direct path
         if 'path' in event:
             return event['path']
         
-        # Raw path (HTTP API)
         if 'rawPath' in event:
             return event['rawPath']
         
-        # Request context path
-        if 'requestContext' in event:
-            if 'http' in event['requestContext'] and 'path' in event['requestContext']['http']:
-                return event['requestContext']['http']['path']
-            if 'path' in event['requestContext']:
-                return event['requestContext']['path']
+        if 'requestContext' in event and 'http' in event['requestContext']:
+            return event['requestContext']['http'].get('path', '/')
         
         return '/'
     
@@ -256,9 +240,9 @@ class CompleteChromeBinaryLambdaHandler:
         if 'httpMethod' in event and 'resource' in event:
             return 'API_Gateway_REST'
         elif 'requestContext' in event and 'http' in event['requestContext']:
-            return 'API_Gateway_HTTP'
-        elif 'requestContext' in event and 'routeKey' in event['requestContext']:
-            return 'Lambda_Function_URL'
+            return 'API_Gateway_HTTP_v2'
+        elif 'version' in event and event.get('version') == '2.0':
+            return 'Lambda_Function_URL_v2'
         else:
             return 'Unknown'
     
@@ -291,14 +275,14 @@ class CompleteChromeBinaryLambdaHandler:
         }
 
 # Global handler instance
-complete_chrome_handler = CompleteChromeBinaryLambdaHandler()
+http_scraping_handler = HTTPScrapingLambdaHandler()
 
 def handler(event, context):
     """
-    Complete Chrome Binary Lambda entry point
+    HTTP Scraping Lambda entry point (Browser-free)
     This is the function that AWS Lambda will call
     """
-    return complete_chrome_handler.handle_request(event, context)
+    return http_scraping_handler.handle_request(event, context)
 
 # For backward compatibility
 lambda_handler = handler

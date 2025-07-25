@@ -1,26 +1,25 @@
 """
 Enhanced Health Check for MCQ Scraper Lambda Function
-FIXED: Chrome Binary Compatibility Check
+FINAL SOLUTION: HTTP-based scraping status
 """
 
 import os
 import asyncio
 import logging
-import subprocess
 from datetime import datetime
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
-class ChromeBinaryHealthChecker:
-    """Health checker for Chrome binary approach"""
+class HTTPScrapingHealthChecker:
+    """Health checker for HTTP-based scraping approach"""
     
     def __init__(self):
         self.last_check_time = None
         self.cached_health_data = None
     
     async def get_comprehensive_health_status(self) -> Dict[str, Any]:
-        """Get comprehensive health status including Chrome binary functionality"""
+        """Get comprehensive health status for HTTP scraping"""
         try:
             current_time = datetime.now()
             
@@ -32,16 +31,17 @@ class ChromeBinaryHealthChecker:
             # Basic system info
             health_data = {
                 "status": "healthy",
-                "version": "3.0.2",  # Updated version for Chrome binary approach
+                "version": "4.0.0",  # New major version - HTTP scraping
                 "timestamp": current_time.isoformat(),
                 "environment": os.environ.get('ENVIRONMENT', 'unknown'),
-                "approach": "chrome_binary_compatible",
-                "chrome_path": os.environ.get('CHROME_BINARY_PATH', 'not_set')
+                "approach": "http_requests_scraping",
+                "browser_required": False,
+                "lambda_compatible": True
             }
             
-            # Check Chrome binary status
-            chrome_status = await self._check_chrome_binary_status()
-            health_data["browser_status"] = chrome_status
+            # Check HTTP scraping capabilities
+            scraping_status = self._check_http_scraping_status()
+            health_data["scraping_status"] = scraping_status
             
             # Check S3 integration
             s3_status = self._check_s3_integration()
@@ -56,9 +56,9 @@ class ChromeBinaryHealthChecker:
             health_data["job_storage"] = job_storage_status
             
             # Determine overall status
-            if not chrome_status["installed"] or chrome_status.get("test_failed", False):
+            if not scraping_status["http_client_ready"] or not scraping_status["html_parser_ready"]:
                 health_data["status"] = "degraded"
-                health_data["warnings"] = ["Chrome binary functionality limited"]
+                health_data["warnings"] = ["HTTP scraping capabilities limited"]
             
             # Cache the result
             self.cached_health_data = health_data
@@ -70,116 +70,61 @@ class ChromeBinaryHealthChecker:
             logger.error(f"Error in health check: {e}")
             return {
                 "status": "error",
-                "version": "3.0.2",
-                "approach": "chrome_binary_compatible",
+                "version": "4.0.0",
+                "approach": "http_requests_scraping",
                 "error": str(e),
                 "timestamp": datetime.now().isoformat()
             }
     
-    async def _check_chrome_binary_status(self) -> Dict[str, Any]:
-        """Check Chrome binary installation and functionality"""
-        chrome_status = {
-            "installed": False,
-            "installation_attempted": True,
-            "installation_error": None,
-            "browser_pool_initialized": False,
+    def _check_http_scraping_status(self) -> Dict[str, Any]:
+        """Check HTTP scraping capabilities"""
+        scraping_status = {
+            "http_client_ready": False,
+            "html_parser_ready": False,
+            "requests_version": None,
+            "beautifulsoup_version": None,
             "test_passed": False,
-            "test_error": None,
-            "chrome_version": None,
-            "binary_path": None
+            "test_error": None
         }
         
         try:
-            # Check if Chrome binary exists
-            chrome_path = os.environ.get('CHROME_BINARY_PATH', '/opt/chrome/chrome')
-            chrome_status["binary_path"] = chrome_path
-            
-            if not os.path.exists(chrome_path):
-                chrome_status["installation_error"] = f"Chrome binary not found: {chrome_path}"
-                return chrome_status
-            
-            if not os.access(chrome_path, os.X_OK):
-                chrome_status["installation_error"] = f"Chrome binary not executable: {chrome_path}"
-                return chrome_status
-            
-            # Test Chrome binary version
+            # Check requests library
             try:
-                result = await asyncio.wait_for(
-                    asyncio.create_subprocess_exec(
-                        chrome_path, '--version',
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    ),
-                    timeout=10.0
-                )
-                
-                stdout, stderr = await result.communicate()
-                
-                if result.returncode == 0:
-                    chrome_version = stdout.decode().strip()
-                    chrome_status["installed"] = True
-                    chrome_status["chrome_version"] = chrome_version
-                    chrome_status["browser_pool_initialized"] = True
-                    
-                    # Test basic Chrome functionality
-                    try:
-                        test_result = await asyncio.wait_for(
-                            self._test_chrome_functionality(chrome_path),
-                            timeout=15.0
-                        )
-                        chrome_status["test_passed"] = test_result
-                        
-                    except asyncio.TimeoutError:
-                        chrome_status["test_error"] = "Chrome functionality test timeout"
-                        chrome_status["test_failed"] = True
-                    except Exception as e:
-                        chrome_status["test_error"] = str(e)
-                        chrome_status["test_failed"] = True
-                        
+                import requests
+                scraping_status["http_client_ready"] = True
+                scraping_status["requests_version"] = requests.__version__
+                logger.info(f"✅ Requests available: {requests.__version__}")
+            except ImportError as e:
+                scraping_status["test_error"] = f"Requests not available: {e}"
+                return scraping_status
+            
+            # Check BeautifulSoup
+            try:
+                import bs4
+                scraping_status["html_parser_ready"] = True
+                scraping_status["beautifulsoup_version"] = bs4.__version__
+                logger.info(f"✅ BeautifulSoup available: {bs4.__version__}")
+            except ImportError as e:
+                scraping_status["test_error"] = f"BeautifulSoup not available: {e}"
+                return scraping_status
+            
+            # Test HTTP functionality
+            try:
+                response = requests.get('https://httpbin.org/get', timeout=5)
+                if response.status_code == 200:
+                    scraping_status["test_passed"] = True
+                    logger.info("✅ HTTP scraping test passed")
                 else:
-                    chrome_status["installation_error"] = f"Chrome version check failed: {stderr.decode()}"
+                    scraping_status["test_error"] = f"HTTP test failed: {response.status_code}"
                     
-            except asyncio.TimeoutError:
-                chrome_status["installation_error"] = "Chrome binary test timeout"
             except Exception as e:
-                chrome_status["installation_error"] = f"Chrome binary test error: {e}"
+                scraping_status["test_error"] = f"HTTP test failed: {e}"
+                # Don't fail completely - network issues are common in Lambda cold starts
             
         except Exception as e:
-            chrome_status["installation_error"] = f"Chrome check failed: {e}"
+            scraping_status["test_error"] = f"HTTP scraping check failed: {e}"
         
-        return chrome_status
-    
-    async def _test_chrome_functionality(self, chrome_path: str) -> bool:
-        """Test if Chrome binary can be used with Playwright"""
-        try:
-            from playwright.async_api import async_playwright
-            
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    executable_path=chrome_path,
-                    args=[
-                        '--no-sandbox',
-                        '--disable-setuid-sandbox',
-                        '--disable-dev-shm-usage',
-                        '--disable-gpu',
-                        '--no-zygote',
-                        '--single-process',
-                        '--disable-web-security'
-                    ]
-                )
-                
-                # Simple page test
-                page = await browser.new_page()
-                await page.goto('data:text/html,<h1>Chrome Binary Test</h1>', timeout=10000)
-                title = await page.title()
-                await browser.close()
-                
-                return len(title) > 0
-                
-        except Exception as e:
-            logger.error(f"Chrome functionality test failed: {e}")
-            return False
+        return scraping_status
     
     def _check_s3_integration(self) -> Dict[str, Any]:
         """Check S3 integration status"""
@@ -240,7 +185,7 @@ class ChromeBinaryHealthChecker:
             }
 
 # Global health checker instance
-health_checker = ChromeBinaryHealthChecker()
+health_checker = HTTPScrapingHealthChecker()
 
 async def get_health_status() -> Dict[str, Any]:
     """Get comprehensive health status - async version"""
@@ -255,8 +200,9 @@ def get_health_status_sync() -> Dict[str, Any]:
         # Fallback for environments where async doesn't work
         return {
             "status": "healthy", 
-            "version": "3.0.2",
-            "approach": "chrome_binary_compatible",
+            "version": "4.0.0",
+            "approach": "http_requests_scraping",
+            "browser_required": False,
             "timestamp": datetime.now().isoformat(),
             "note": "Basic health check (async not available)"
         }

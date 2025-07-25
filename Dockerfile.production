@@ -1,43 +1,20 @@
-# PRODUCTION AWS Lambda Dockerfile - COMPLETE CHROME BINARY SOLUTION
+# PRODUCTION AWS Lambda Dockerfile - HTTP SCRAPING SOLUTION (No Browser Required)
 FROM public.ecr.aws/lambda/python:3.11
 
-# Install system dependencies for Chrome (optimized for Lambda)
+# Install minimal system dependencies (no browser needed)
 RUN yum update -y && \
     yum install -y \
-    wget \
-    unzip \
     curl \
-    which \
-    libX11 \
-    libXcomposite \
-    libXcursor \
-    libXdamage \
-    libXext \
-    libXi \
-    libXrandr \
-    libXrender \
-    libXss \
-    libXtst \
-    nss \
-    nspr \
-    atk \
-    at-spi2-atk \
-    cups-libs \
-    libdrm \
-    gtk3 \
-    libxkbcommon \
+    wget \
     && yum clean all
 
-# Set Chrome-optimized environment variables
-ENV CHROME_BINARY_PATH=/opt/chrome/chrome
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/chrome
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# Set environment variables for HTTP scraping approach
+ENV SCRAPING_APPROACH=http_requests
 ENV PYTHONPATH=/opt/python:/var/task
-ENV BROWSER_APPROACH=chrome_binary
+ENV ENVIRONMENT=lambda
 
-# Create required directories with proper permissions
-RUN mkdir -p /opt/chrome /tmp/pdfs /var/task && \
-    chmod -R 755 /opt/chrome && \
+# Create required directories
+RUN mkdir -p /tmp/pdfs /var/task && \
     chmod -R 777 /tmp
 
 # Copy requirements first for better Docker layer caching
@@ -46,39 +23,24 @@ COPY requirements-lambda.txt .
 # Install Python dependencies to Lambda layer directory
 RUN pip install --no-cache-dir --target /opt/python -r requirements-lambda.txt
 
-# Download and install Chrome binary for Amazon Linux 2
-RUN cd /tmp && \
-    # Download compatible Chrome binary
-    wget -q -O chrome.zip https://github.com/adieuadieu/serverless-chrome/releases/download/v1.0.0-57/stable-headless-chromium-amazonlinux-2.zip && \
-    # Extract Chrome binary
-    unzip -q chrome.zip && \
-    # Move to final location
-    mv headless-chromium /opt/chrome/chrome && \
-    # Set proper permissions
-    chmod +x /opt/chrome/chrome && \
-    # Clean up
-    rm chrome.zip && \
-    # Verify installation
-    /opt/chrome/chrome --version --no-sandbox --disable-gpu || echo "Chrome verification will retry at runtime"
-
 # Copy application code to Lambda task directory
 COPY server.py competitive_exam_keywords.py health_check.py ./
-COPY install_playwright.py post_deploy_setup.py ./  
 COPY lambda_handler_production.py ./
 COPY s3_production_integration.py ./
 
 # Set proper executable permissions  
-RUN chmod +x lambda_handler_production.py install_playwright.py post_deploy_setup.py
+RUN chmod +x lambda_handler_production.py
 
-# Create Chrome startup verification script
+# Create verification script
 RUN echo '#!/bin/bash\n\
-echo "=== Chrome Binary Verification ==="\n\
-/opt/chrome/chrome --version --no-sandbox --disable-gpu\n\
-echo "=== Verification Complete ==="' > /opt/verify_chrome.sh && \
-    chmod +x /opt/verify_chrome.sh
+echo "=== HTTP Scraping Solution Verification ==="\n\
+python3 -c "import requests; print(f\"Requests: {requests.__version__}\")"\n\
+python3 -c "import beautifulsoup4; print(\"BeautifulSoup: Available\")"\n\
+echo "=== Verification Complete ==="' > /opt/verify_http.sh && \
+    chmod +x /opt/verify_http.sh
 
 # Run verification during build
-RUN /opt/verify_chrome.sh || echo "⚠️ Chrome verification failed during build, will retry at runtime"
+RUN /opt/verify_http.sh
 
 # Set the Lambda handler
 CMD ["lambda_handler_production.handler"]
