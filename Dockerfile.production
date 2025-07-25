@@ -55,7 +55,7 @@ RUN cd /opt/python && \
 COPY server.py competitive_exam_keywords.py health_check.py ./
 COPY install_playwright.py post_deploy_setup.py ./
 COPY lambda_handler_production.py ./
-COPY s3_lambda_integration.py ./
+COPY s3_production_integration.py ./
 
 # Set executable permissions
 RUN chmod +x lambda_handler_production.py
