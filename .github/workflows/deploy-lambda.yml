@@ -1,9 +1,8 @@
-# GitHub Actions Workflow for Lambda Deployment
 name: Deploy MCQ Scraper to AWS Lambda
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:
 
 env:
@@ -13,34 +12,121 @@ env:
 
 jobs:
   deploy:
-    name: Deploy to Lambda
+    name: Deploy to AWS Lambda
     runs-on: ubuntu-latest
-
+    
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
-
-    - name: Configure AWS credentials
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: 🔐 Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ env.AWS_REGION }}
-
-    - name: Login to Amazon ECR
-      id: login-ecr
+    
+    - name: 🔍 Verify AWS CLI access
+      run: |
+        echo "Testing AWS CLI access..."
+        aws sts get-caller-identity
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        echo "Account ID: $ACCOUNT_ID"
+        echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_ENV
+        
+    - name: 📋 Set up environment variables
+      run: |
+        echo "ECR_REGISTRY=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com" >> $GITHUB_ENV
+        echo "ECR_REPOSITORY_URI=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY" >> $GITHUB_ENV
+        echo "IMAGE_TAG=lambda-$(echo $GITHUB_SHA | cut -c1-8)" >> $GITHUB_ENV
+        
+    - name: 🐳 Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: 🔐 Login to Amazon ECR
       uses: aws-actions/amazon-ecr-login@v1
-
-    - name: Build, tag, and push image to Amazon ECR
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        IMAGE_TAG: latest
+      with:
+        registry-type: private
+        
+    - name: 🏗️ Create ECR repository if it doesn't exist
       run: |
-        docker build -f Dockerfile.lambda -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
-    - name: Update Lambda function
+        aws ecr describe-repositories --repository-names $ECR_REPOSITORY 2>/dev/null || \
+        aws ecr create-repository --repository-name $ECR_REPOSITORY --image-scanning-configuration scanOnPush=true
+        
+    - name: 🔨 Build and push Docker image
       run: |
-        aws lambda update-function-code \
+        echo "Building Docker image..."
+        docker build -f Dockerfile.production -t $ECR_REPOSITORY:latest .
+        
+        echo "Tagging Docker image..."
+        docker tag $ECR_REPOSITORY:latest $ECR_REPOSITORY_URI:latest
+        docker tag $ECR_REPOSITORY:latest $ECR_REPOSITORY_URI:$IMAGE_TAG
+        
+        echo "Pushing Docker image..."
+        docker push $ECR_REPOSITORY_URI:latest
+        docker push $ECR_REPOSITORY_URI:$IMAGE_TAG
+        
+        echo "Docker image pushed successfully!"
+        echo "IMAGE_URI=$ECR_REPOSITORY_URI:$IMAGE_TAG" >> $GITHUB_ENV
+        
+    - name: ⚡ Update Lambda function
+      run: |
+        echo "Updating Lambda function code..."
+        
+        # Check if Lambda function exists
+        if aws lambda get-function --function-name $LAMBDA_FUNCTION_NAME 2>/dev/null; then
+          echo "Lambda function exists, updating code..."
+          aws lambda update-function-code \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --image-uri $IMAGE_URI
+            
+          echo "Waiting for update to complete..."
+          aws lambda wait function-updated --function-name $LAMBDA_FUNCTION_NAME
+          
+          echo "Updating function configuration..."
+          aws lambda update-function-configuration \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --timeout 900 \
+            --memory-size 3008 \
+            --environment Variables="{
+              PDF_BUCKET_NAME=${{ secrets.PDF_BUCKET_NAME }},
+              PLAYWRIGHT_BROWSERS_PATH=/opt/python/pw-browsers,
+              ENVIRONMENT=lambda
+            }"
+        else
+          echo "❌ Lambda function $LAMBDA_FUNCTION_NAME does not exist!"
+          echo "Please create the Lambda function manually in AWS Console first."
+          echo "Use the following settings:"
+          echo "  - Function name: $LAMBDA_FUNCTION_NAME"
+          echo "  - Container image URI: $IMAGE_URI"
+          echo "  - Execution role: mcq-scraper-lambda-role"
+          echo "  - Memory: 3008 MB"
+          echo "  - Timeout: 15 minutes"
+          exit 1
+        fi
+        
+    - name: 🧪 Test Lambda function
+      run: |
+        echo "Testing Lambda function..."
+        aws lambda invoke \
           --function-name $LAMBDA_FUNCTION_NAME \
-          --image-uri ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:latest
+          --payload '{"httpMethod":"GET","path":"/health","headers":{},"body":null}' \
+          --cli-binary-format raw-in-base64-out \
+          response.json
+          
+        echo "Lambda response:"
+        cat response.json | jq . || cat response.json
+        
+    - name: 📊 Deployment summary
+      run: |
+        echo "✅ Deployment completed successfully!"
+        echo ""
+        echo "🔗 Resources:"
+        echo "   ECR Repository: $ECR_REPOSITORY_URI"
+        echo "   Lambda Function: $LAMBDA_FUNCTION_NAME"
+        echo "   Image Tag: $IMAGE_TAG"
+        echo ""
+        echo "📋 Next steps:"
+        echo "   1. Test your API Gateway endpoint"
+        echo "   2. Deploy frontend to S3"
+        echo "   3. Test complete application"
