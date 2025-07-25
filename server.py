@@ -15,8 +15,15 @@ from pathlib import Path
 import logging
 import pickle
 import hashlib
-from bs4 import BeautifulSoup
 import time
+import threading
+from bs4 import BeautifulSoup
+import base64
+import io
+from PIL import Image as PILImage
+import concurrent.futures
+import aiohttp
+import aiofiles
 
 from reportlab.lib.pagesizes import letter, A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle
@@ -32,55 +39,50 @@ try:
     from s3_production_integration import get_pdf_directory, upload_pdf_to_s3_lambda, LAMBDA_S3_INTEGRATION
     print("✅ Production Lambda S3 integration loaded")
 except ImportError:
-    try:
-        from s3_lambda_integration import get_pdf_directory, upload_pdf_to_s3_lambda
-        LAMBDA_S3_INTEGRATION = True
-        print("✅ Lambda S3 integration loaded")
-    except ImportError:
-        LAMBDA_S3_INTEGRATION = False
-        print("ℹ️ Using standard file storage (non-Lambda environment)")
+    LAMBDA_S3_INTEGRATION = False
+    print("ℹ️ Using standard file storage (non-Lambda environment)")
+    
+    def get_pdf_directory() -> Path:
+        """Environment-aware PDF directory configuration."""
+        cloud_env_indicators = [
+            'DYNO', 'RENDER', 'VERCEL', 'RAILWAY_ENVIRONMENT', 
+            'GOOGLE_CLOUD_PROJECT', 'AWS_LAMBDA_FUNCTION_NAME', 
+            'AZURE_FUNCTIONS_ENVIRONMENT'
+        ]
         
-        def get_pdf_directory() -> Path:
-            """Environment-aware PDF directory configuration."""
-            cloud_env_indicators = [
-                'DYNO', 'RENDER', 'VERCEL', 'RAILWAY_ENVIRONMENT', 
-                'GOOGLE_CLOUD_PROJECT', 'AWS_LAMBDA_FUNCTION_NAME', 
-                'AZURE_FUNCTIONS_ENVIRONMENT'
-            ]
-            
-            is_cloud_environment = any(os.getenv(indicator) for indicator in cloud_env_indicators)
-            is_container = os.path.exists('/.dockerenv') or os.path.exists('/proc/1/cgroup')
-            
+        is_cloud_environment = any(os.getenv(indicator) for indicator in cloud_env_indicators)
+        is_container = os.path.exists('/.dockerenv') or os.path.exists('/proc/1/cgroup')
+        
+        app_dir_writable = False
+        try:
+            test_file = Path("/app/.write_test")
+            test_file.touch()
+            test_file.unlink()
+            app_dir_writable = True
+        except (PermissionError, OSError):
             app_dir_writable = False
-            try:
-                test_file = Path("/app/.write_test")
-                test_file.touch()
-                test_file.unlink()
-                app_dir_writable = True
-            except (PermissionError, OSError):
-                app_dir_writable = False
-            
-            if is_cloud_environment or is_container or not app_dir_writable:
+        
+        if is_cloud_environment or is_container or not app_dir_writable:
+            pdf_dir = Path("/tmp/pdfs")
+            print(f"🌤️  Using cloud-compatible PDF directory: {pdf_dir}")
+        else:
+            pdf_dir = Path("/app/pdfs")
+            print(f"🏠 Using development PDF directory: {pdf_dir}")
+        
+        try:
+            pdf_dir.mkdir(parents=True, exist_ok=True)
+            print(f"✅ PDF directory ready: {pdf_dir}")
+        except Exception as e:
+            print(f"❌ Error creating PDF directory {pdf_dir}: {e}")
+            if pdf_dir != Path("/tmp/pdfs"):
+                print("🔄 Falling back to /tmp/pdfs...")
                 pdf_dir = Path("/tmp/pdfs")
-                print(f"🌤️  Using cloud-compatible PDF directory: {pdf_dir}")
-            else:
-                pdf_dir = Path("/app/pdfs")
-                print(f"🏠 Using development PDF directory: {pdf_dir}")
-            
-            try:
                 pdf_dir.mkdir(parents=True, exist_ok=True)
-                print(f"✅ PDF directory ready: {pdf_dir}")
-            except Exception as e:
-                print(f"❌ Error creating PDF directory {pdf_dir}: {e}")
-                if pdf_dir != Path("/tmp/pdfs"):
-                    print("🔄 Falling back to /tmp/pdfs...")
-                    pdf_dir = Path("/tmp/pdfs")
-                    pdf_dir.mkdir(parents=True, exist_ok=True)
-                    print(f"✅ Fallback PDF directory ready: {pdf_dir}")
-                else:
-                    raise
-            
-            return pdf_dir
+                print(f"✅ Fallback PDF directory ready: {pdf_dir}")
+            else:
+                raise
+        
+        return pdf_dir
 
 # Load environment variables
 load_dotenv()
@@ -89,11 +91,11 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# HTTP SCRAPING MANAGER - Lambda Compatible Solution
-class HTTPScrapingManager:
+# LAMBDA-COMPATIBLE HTTP SCRAPING MANAGER
+class LambdaHTTPScrapingManager:
     """
-    HTTP-based scraping manager - No browser required
-    Perfect for AWS Lambda environments
+    Lambda-compatible HTTP scraping manager with 30 concurrent processes support
+    Replaces Playwright browser automation with HTTP requests + BeautifulSoup
     """
     
     def __init__(self):
@@ -102,89 +104,105 @@ class HTTPScrapingManager:
         self.scraping_stats = {
             "requests_made": 0,
             "successful_scrapes": 0,
-            "failed_scrapes": 0
+            "failed_scrapes": 0,
+            "concurrent_processes": 0
         }
+        self.max_concurrent_processes = 30
+        self.semaphore = asyncio.Semaphore(self.max_concurrent_processes)
         
-    def initialize(self):
-        """Initialize HTTP session with optimal settings"""
+    async def initialize(self):
+        """Initialize HTTP session for Lambda environment"""
         if self.is_initialized:
             return
             
         try:
-            self.session = requests.Session()
-            
-            # Optimize session for scraping
-            self.session.headers.update({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-            })
-            
-            # Configure session for reliability
-            adapter = requests.adapters.HTTPAdapter(
-                max_retries=requests.adapters.Retry(
-                    total=3,
-                    backoff_factor=1,
-                    status_forcelist=[502, 503, 504, 429]
-                )
+            # Create aiohttp session with optimized settings for Lambda
+            timeout = aiohttp.ClientTimeout(total=15, connect=10)
+            connector = aiohttp.TCPConnector(
+                limit=50,  # Total connection limit
+                limit_per_host=10,  # Per-host connection limit
+                ttl_dns_cache=300,
+                use_dns_cache=True,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True
             )
             
-            self.session.mount('http://', adapter)
-            self.session.mount('https://', adapter)
+            self.session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Referer': 'https://testbook.com'
+                }
+            )
             
             self.is_initialized = True
-            print("✅ HTTP Scraping Manager initialized successfully")
+            print("✅ Lambda HTTP Scraping Manager initialized for 30 concurrent processes")
             
         except Exception as e:
             print(f"❌ Error initializing HTTP Scraping Manager: {e}")
             raise
     
-    async def scrape_mcq_page(self, url: str, topic: str, exam_type: str = "SSC") -> Optional[dict]:
-        """Scrape MCQ page using HTTP requests and BeautifulSoup"""
+    async def scrape_testbook_page_concurrent(self, url: str, topic: str, exam_type: str = "SSC") -> Optional[dict]:
+        """Scrape testbook page with concurrent processing support"""
+        async with self.semaphore:
+            self.scraping_stats["concurrent_processes"] += 1
+            try:
+                result = await self._scrape_testbook_page_internal(url, topic, exam_type)
+                if result:
+                    self.scraping_stats["successful_scrapes"] += 1
+                else:
+                    self.scraping_stats["failed_scrapes"] += 1
+                return result
+            finally:
+                self.scraping_stats["concurrent_processes"] -= 1
+    
+    async def _scrape_testbook_page_internal(self, url: str, topic: str, exam_type: str) -> Optional[dict]:
+        """Internal scraping with HTTP requests and BeautifulSoup"""
         try:
             if not self.is_initialized:
-                self.initialize()
+                await self.initialize()
             
             print(f"🔍 HTTP scraping: {url}")
             self.scraping_stats["requests_made"] += 1
             
-            # Fetch page content
-            response = self.session.get(url, timeout=15)
-            response.raise_for_status()
+            # Fetch page content with retry logic
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    async with self.session.get(url) as response:
+                        if response.status == 200:
+                            html_content = await response.text()
+                            break
+                        else:
+                            print(f"❌ HTTP {response.status} for {url}")
+                            if attempt == max_retries - 1:
+                                return None
+                except Exception as e:
+                    print(f"⚠️ Request attempt {attempt + 1} failed: {e}")
+                    if attempt == max_retries - 1:
+                        return None
+                    await asyncio.sleep(1)
             
-            # Parse HTML content
-            soup = BeautifulSoup(response.content, 'html.parser')
+            # Parse HTML with BeautifulSoup
+            soup = BeautifulSoup(html_content, 'html.parser')
             
-            # Extract MCQ data using CSS selectors
-            mcq_data = self._extract_mcq_from_soup(soup, url, topic, exam_type)
+            # Extract MCQ data
+            mcq_data = await self._extract_mcq_from_soup(soup, url, topic, exam_type)
             
-            if mcq_data:
-                self.scraping_stats["successful_scrapes"] += 1
-                print(f"✅ Successfully scraped MCQ from {url}")
-                return mcq_data
-            else:
-                self.scraping_stats["failed_scrapes"] += 1
-                print(f"❌ No MCQ data found on {url}")
-                return None
-                
-        except requests.exceptions.Timeout:
-            print(f"⏱️ Timeout scraping {url}")
-            self.scraping_stats["failed_scrapes"] += 1
-            return None
-        except requests.exceptions.RequestException as e:
-            print(f"❌ Request error scraping {url}: {e}")
-            self.scraping_stats["failed_scrapes"] += 1
-            return None
+            return mcq_data
+            
         except Exception as e:
             print(f"❌ Error scraping {url}: {e}")
-            self.scraping_stats["failed_scrapes"] += 1
             return None
     
-    def _extract_mcq_from_soup(self, soup: BeautifulSoup, url: str, topic: str, exam_type: str) -> Optional[dict]:
-        """Extract MCQ data from parsed HTML"""
+    async def _extract_mcq_from_soup(self, soup: BeautifulSoup, url: str, topic: str, exam_type: str) -> Optional[dict]:
+        """Extract MCQ data from BeautifulSoup with relevancy checks"""
         try:
             # Extract question
             question = ""
@@ -192,8 +210,7 @@ class HTTPScrapingManager:
                 'h1.questionBody.tag-h1',
                 'div.questionBody', 
                 'h1.question',
-                '.question-text',
-                '[class*="question"]'
+                '.question-text'
             ]
             
             for selector in question_selectors:
@@ -210,39 +227,6 @@ class HTTPScrapingManager:
             if not self._is_topic_relevant(question, topic):
                 print(f"❌ Question not relevant for topic '{topic}' on {url}")
                 return None
-            
-            # Extract options
-            options = []
-            option_selectors = [
-                'li.option',
-                '.option',
-                '[class*="option"]',
-                'ul li'
-            ]
-            
-            for selector in option_selectors:
-                option_elements = soup.select(selector)
-                if option_elements:
-                    for elem in option_elements:
-                        option_text = self._clean_text(elem.get_text())
-                        if option_text and len(option_text.strip()) > 0:
-                            options.append(option_text)
-                    break
-            
-            # Extract answer/solution
-            answer = ""
-            answer_selectors = [
-                '.solution',
-                '.answer',
-                '[class*="solution"]',
-                '[class*="answer"]'
-            ]
-            
-            for selector in answer_selectors:
-                answer_elem = soup.select_one(selector)
-                if answer_elem:
-                    answer = self._clean_text(answer_elem.get_text())
-                    break
             
             # Extract exam source information
             exam_source_heading = ""
@@ -264,7 +248,24 @@ class HTTPScrapingManager:
                 print(f"❌ MCQ not relevant for exam type '{exam_type}' on {url}")
                 return None
             
-            # Return MCQ data if we have at least question and some content
+            # Extract options
+            options = []
+            option_elements = soup.select('li.option')
+            for elem in option_elements:
+                option_text = self._clean_text(elem.get_text())
+                if option_text:
+                    options.append(option_text)
+            
+            # Extract answer/solution
+            answer = ""
+            answer_elem = soup.select_one('.solution')
+            if answer_elem:
+                answer = self._clean_text(answer_elem.get_text())
+            
+            # Generate screenshot (Lambda-compatible approach)
+            screenshot = await self._generate_screenshot_simulation(soup, url)
+            
+            # Return MCQ data if we have sufficient content
             if question and (options or answer):
                 return {
                     "url": url,
@@ -273,8 +274,9 @@ class HTTPScrapingManager:
                     "answer": answer,
                     "exam_source_heading": exam_source_heading,
                     "exam_source_title": exam_source_title,
+                    "screenshot": screenshot,
                     "is_relevant": True,
-                    "scraping_method": "http_requests"
+                    "scraping_method": "lambda_http_requests"
                 }
             else:
                 print(f"❌ Insufficient MCQ data extracted from {url}")
@@ -282,6 +284,40 @@ class HTTPScrapingManager:
                 
         except Exception as e:
             print(f"❌ Error extracting MCQ data from {url}: {e}")
+            return None
+    
+    async def _generate_screenshot_simulation(self, soup: BeautifulSoup, url: str) -> Optional[str]:
+        """Generate screenshot simulation for Lambda environment"""
+        try:
+            # Create a simple text-based representation as base64 image
+            # This replaces the actual screenshot functionality for Lambda
+            from PIL import Image, ImageDraw, ImageFont
+            
+            # Create a simple image representation
+            img = Image.new('RGB', (800, 600), color='white')
+            draw = ImageDraw.Draw(img)
+            
+            # Add URL text
+            try:
+                # Try to use a default font
+                font = ImageFont.load_default()
+            except:
+                font = None
+            
+            draw.text((10, 10), f"URL: {url}", fill='black', font=font)
+            draw.text((10, 30), "Lambda HTTP Scraping", fill='blue', font=font)
+            draw.text((10, 50), "Screenshot simulation", fill='gray', font=font)
+            
+            # Convert to base64
+            buffer = io.BytesIO()
+            img.save(buffer, format='PNG')
+            buffer.seek(0)
+            
+            screenshot_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+            return screenshot_base64
+            
+        except Exception as e:
+            print(f"⚠️ Error generating screenshot simulation: {e}")
             return None
     
     def _clean_text(self, text: str) -> str:
@@ -292,17 +328,15 @@ class HTTPScrapingManager:
         # Remove extra whitespace and clean up
         text = ' '.join(text.split())
         
-        # Remove common unwanted patterns
+        # Remove unwanted patterns
         unwanted_patterns = [
-            r'\s*\n\s*',
-            r'\s*\r\s*',
-            r'\s*\t\s*',
-            r'^\s*[-•]\s*',  # Remove bullet points
-            r'\s+',  # Multiple spaces
+            "Download Solution PDF", "Download PDF", "Attempt Online",
+            "View all BPSC Exam Papers >", "View all SSC Exam Papers >",
+            "View all BPSC Exam Papers", "View all SSC Exam Papers"
         ]
         
         for pattern in unwanted_patterns:
-            text = re.sub(pattern, ' ', text)
+            text = text.replace(pattern, "")
         
         return text.strip()
     
@@ -350,22 +384,31 @@ class HTTPScrapingManager:
         
         return False
     
+    async def close(self):
+        """Close HTTP session"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+            self.is_initialized = False
+    
     def get_stats(self) -> dict:
         """Get scraping statistics"""
         return {
             "initialized": self.is_initialized,
             "scraping_stats": self.scraping_stats,
+            "max_concurrent_processes": self.max_concurrent_processes,
             "success_rate": (
-                self.scraping_stats["successful_scrapes"] / max(self.scraping_stats["requests_made"], 1) * 100
+                self.scraping_stats["successful_scrapes"] / 
+                max(self.scraping_stats["requests_made"], 1) * 100
             )
         }
 
 # Global HTTP scraping manager
-http_scraper = HTTPScrapingManager()
+http_scraper = LambdaHTTPScrapingManager()
 
-# PERSISTENT JOB STORAGE
+# PERSISTENT JOB STORAGE - Lambda Compatible
 class PersistentJobStorage:
-    """Persistent storage for job progress"""
+    """Persistent storage for job progress - Lambda compatible"""
     
     def __init__(self):
         self.storage_file = "/tmp/job_progress.pkl"
@@ -454,13 +497,14 @@ class PersistentJobStorage:
 # Global persistent job storage
 persistent_storage = PersistentJobStorage()
 
-# API KEY MANAGEMENT
+# API KEY MANAGEMENT - Enhanced for Lambda
 class APIKeyManager:
-    """API Key management for Google Custom Search"""
+    """API Key management for Google Custom Search - Lambda optimized"""
     
     def __init__(self):
         self.api_keys = []
         self.current_key_index = 0
+        self.exhausted_keys = set()
         self._load_api_keys()
     
     def _load_api_keys(self):
@@ -492,16 +536,28 @@ class APIKeyManager:
         if not self.api_keys:
             return None
         
-        self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
+        current_key = self.api_keys[self.current_key_index]
+        self.exhausted_keys.add(current_key)
         
-        if self.current_key_index == 0:
-            return None
+        for i in range(len(self.api_keys)):
+            key = self.api_keys[i]
+            if key not in self.exhausted_keys:
+                self.current_key_index = i
+                return key
         
-        return self.api_keys[self.current_key_index]
+        return None
+    
+    def is_quota_error(self, error_message: str) -> bool:
+        """Check if error is quota related"""
+        quota_indicators = [
+            "quota exceeded", "quotaExceeded", "rateLimitExceeded",
+            "userRateLimitExceeded", "dailyLimitExceeded", "Too Many Requests"
+        ]
+        return any(indicator.lower() in error_message.lower() for indicator in quota_indicators)
     
     def get_remaining_keys(self) -> int:
         """Get number of remaining keys"""
-        return len(self.api_keys) - self.current_key_index - 1
+        return len(self.api_keys) - len(self.exhausted_keys)
 
 # Global API key manager
 api_key_manager = APIKeyManager()
@@ -509,8 +565,611 @@ api_key_manager = APIKeyManager()
 # Environment variables
 SEARCH_ENGINE_ID = os.environ.get('SEARCH_ENGINE_ID', '2701a7d64a00d47fd')
 
+# Generated PDFs storage
+generated_pdfs = {}
+
+# Data Models
+class SearchRequest(BaseModel):
+    topic: str
+    exam_type: str = "SSC"
+    pdf_format: str = "text"
+
+class MCQData(BaseModel):
+    question: str
+    options: List[str]
+    answer: str
+    exam_source_heading: str = ""
+    exam_source_title: str = ""
+    is_relevant: bool = True
+
+class JobStatus(BaseModel):
+    job_id: str
+    status: str
+    progress: str
+    total_links: Optional[int] = 0
+    processed_links: Optional[int] = 0
+    mcqs_found: Optional[int] = 0
+    pdf_url: Optional[str] = None
+
+# Lambda-compatible utility functions
+def update_job_progress(job_id: str, status: str, progress: str, **kwargs):
+    """Update job progress using persistent storage"""
+    try:
+        # Clean unicode characters from progress messages
+        clean_progress = progress.encode('utf-8', errors='ignore').decode('utf-8')
+        
+        # Replace emoji characters with text equivalents
+        emoji_replacements = {
+            '🚀': '[STARTING]',
+            '📊': '[STATUS]',
+            '✅': '[SUCCESS]',
+            '❌': '[ERROR]',
+            '⏱️': '[TIMEOUT]',
+            '⚠️': '[WARNING]',
+            '🎯': '[PROCESSING]',
+            '📸': '[SCREENSHOT]',
+            '🖼️': '[IMAGE]',
+            '📄': '[PDF]',
+            '🔄': '[RETRY]',
+            '📍': '[FOUND]',
+            '📏': '[DIMENSIONS]',
+            '🔍': '[SEARCH]',
+            '🌐': '[WEB]',
+            '⭐': '[COMPLETE]',
+            '🎉': '[DONE]',
+            '💡': '[INFO]',
+            '🔧': '[PROCESSING]',
+            '🚩': '[FLAG]',
+            '📈': '[PROGRESS]',
+            '🎪': '[MCQ]',
+            '💾': '[SAVED]'
+        }
+        
+        for emoji, replacement in emoji_replacements.items():
+            clean_progress = clean_progress.replace(emoji, replacement)
+        
+        persistent_storage.update_job(job_id, status, clean_progress, **kwargs)
+    except Exception as e:
+        print(f"[ERROR] Error updating job progress: {e}")
+
+# Google Custom Search - Lambda optimized
+async def search_google_custom(topic: str, exam_type: str = "SSC") -> List[str]:
+    """Search Google Custom Search API - Lambda optimized"""
+    if exam_type.upper() == "BPSC":
+        query = f'{topic} Testbook [Solved] "This question was previously asked in" ("BPSC" OR "Bihar Public Service Commission" OR "BPSC Combined" OR "BPSC Prelims")'
+    else:
+        query = f'{topic} Testbook [Solved] "This question was previously asked in" "SSC"'
+    
+    base_url = "https://www.googleapis.com/customsearch/v1"
+    headers = {
+        "Referer": "https://testbook.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+    
+    all_testbook_links = []
+    start_index = 1
+    max_results = 40
+    
+    try:
+        # Use aiohttp for async requests
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while start_index <= max_results:
+                current_key = api_key_manager.get_current_key()
+                
+                params = {
+                    "key": current_key,
+                    "cx": SEARCH_ENGINE_ID,
+                    "q": query,
+                    "num": 10,
+                    "start": start_index
+                }
+                
+                print(f"🔍 Fetching results {start_index}-{start_index+9} for topic: {topic}")
+                print(f"🔑 Using key: {current_key[:20]}... (Remaining: {api_key_manager.get_remaining_keys()})")
+                
+                async with session.get(base_url, params=params, headers=headers) as response:
+                    if response.status == 429 or (response.status == 403 and "quota" in (await response.text()).lower()):
+                        print(f"⚠️ Quota exceeded for current key. Attempting rotation...")
+                        
+                        next_key = api_key_manager.rotate_key()
+                        if next_key is None:
+                            print("❌ All API keys exhausted!")
+                            raise Exception("All Servers are exhausted due to intense use")
+                        
+                        continue
+                    
+                    response.raise_for_status()
+                    data = await response.json()
+                    
+                    if "items" not in data or len(data["items"]) == 0:
+                        print(f"No more results found after {start_index-1} results")
+                        break
+                    
+                    batch_links = []
+                    for item in data["items"]:
+                        link = item.get("link", "")
+                        if "testbook.com" in link:
+                            batch_links.append(link)
+                    
+                    all_testbook_links.extend(batch_links)
+                    print(f"✅ Found {len(batch_links)} Testbook links in this batch. Total so far: {len(all_testbook_links)}")
+                    
+                    if len(data["items"]) < 10:
+                        print(f"Reached end of results with {len(data['items'])} items in last batch")
+                        break
+                    
+                    start_index += 10
+                    await asyncio.sleep(0.5)
+        
+        print(f"✅ Total Testbook links found: {len(all_testbook_links)}")
+        return all_testbook_links
+        
+    except Exception as e:
+        print(f"❌ Error searching Google: {e}")
+        if "All Servers are exhausted due to intense use" in str(e):
+            raise e
+        return []
+
+# CUSTOM VISUAL ELEMENTS - Beautiful Graphics (from original code)
+class GradientHeader(Flowable):
+    """Custom gradient header with beautiful visual design"""
+    def __init__(self, width, height, title, subtitle=""):
+        Flowable.__init__(self)
+        self.width = width
+        self.height = height
+        self.title = title
+        self.subtitle = subtitle
+        
+    def draw(self):
+        canvas = self.canv
+        
+        # Define colors
+        gradient_start = HexColor('#667eea')
+        white = HexColor('#ffffff')
+        
+        # Gradient background rectangle
+        canvas.setFillColor(gradient_start)
+        canvas.rect(0, 0, self.width, self.height, fill=1, stroke=0)
+        
+        # Overlay with subtle gradient effect
+        canvas.setFillColorRGB(0.4, 0.47, 0.91, alpha=0.8)
+        canvas.rect(0, 0, self.width, self.height * 0.6, fill=1, stroke=0)
+        
+        # Decorative circles
+        canvas.setFillColor(white)
+        canvas.setFillColorRGB(1, 1, 1, alpha=0.2)
+        canvas.circle(self.width - 30, self.height - 20, 15, fill=1)
+        canvas.circle(self.width - 70, self.height - 35, 10, fill=1)
+        canvas.circle(self.width - 110, self.height - 15, 8, fill=1)
+        
+        # Title text
+        canvas.setFillColor(white)
+        canvas.setFont("Helvetica-Bold", 20)
+        text_width = canvas.stringWidth(self.title, "Helvetica-Bold", 20)
+        canvas.drawString((self.width - text_width) / 2, self.height - 35, self.title)
+        
+        # Subtitle if provided
+        if self.subtitle:
+            canvas.setFont("Helvetica", 12)
+            sub_width = canvas.stringWidth(self.subtitle, "Helvetica", 12)
+            canvas.drawString((self.width - sub_width) / 2, self.height - 55, self.subtitle)
+
+class DecorativeSeparator(Flowable):
+    """Beautiful decorative separator line"""
+    def __init__(self, width, height=0.1*inch):
+        Flowable.__init__(self)
+        self.width = width
+        self.height = height
+        
+    def draw(self):
+        canvas = self.canv
+        y = self.height / 2
+        
+        # Define colors
+        primary_color = HexColor('#1a365d')
+        accent_color = HexColor('#38b2ac')
+        secondary_color = HexColor('#2b6cb0')
+        
+        # Main gradient line
+        canvas.setStrokeColor(primary_color)
+        canvas.setLineWidth(3)
+        canvas.line(0, y, self.width * 0.3, y)
+        
+        canvas.setStrokeColor(accent_color)  
+        canvas.line(self.width * 0.3, y, self.width * 0.7, y)
+        
+        canvas.setStrokeColor(secondary_color)
+        canvas.line(self.width * 0.7, y, self.width, y)
+        
+        # Decorative diamonds
+        canvas.setFillColor(accent_color)
+        diamond_size = 4
+        for x_pos in [self.width * 0.2, self.width * 0.5, self.width * 0.8]:
+            canvas.circle(x_pos, y, diamond_size, fill=1)
+
+# PDF Generation - Enhanced for Lambda
+def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: int, irrelevant_mcqs: int, total_links: int) -> str:
+    """Generate BEAUTIFUL PROFESSIONAL PDF - Lambda compatible"""
+    try:
+        pdf_dir = get_pdf_directory()
+        
+        filename = f"Testbook_MCQs_{topic.replace(' ', '_')}_{job_id}.pdf"
+        filepath = pdf_dir / filename
+        
+        doc = SimpleDocTemplate(str(filepath), pagesize=A4, 
+                              topMargin=0.6*inch, bottomMargin=0.6*inch,
+                              leftMargin=0.6*inch, rightMargin=0.6*inch)
+        
+        styles = getSampleStyleSheet()
+        
+        # Premium Color Palette
+        primary_color = HexColor('#1a365d')
+        secondary_color = HexColor('#2b6cb0')
+        accent_color = HexColor('#38b2ac')
+        success_color = HexColor('#48bb78')
+        text_color = HexColor('#2d3748')
+        light_color = HexColor('#f7fafc')
+        gradient_start = HexColor('#667eea')
+        gold_color = HexColor('#d69e2e')
+        
+        # Typography Styles
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=36,
+            spaceAfter=35,
+            alignment=TA_CENTER,
+            textColor=primary_color,
+            fontName='Helvetica-Bold',
+            borderWidth=3,
+            borderColor=accent_color,
+            borderPadding=20,
+            backColor=light_color,
+            leading=45
+        )
+        
+        subtitle_style = ParagraphStyle(
+            'CustomSubtitle',
+            parent=styles['Normal'],
+            fontSize=18,
+            spaceAfter=30,
+            alignment=TA_CENTER,
+            textColor=secondary_color,
+            fontName='Helvetica-Bold',
+            borderWidth=2,
+            borderColor=gold_color,
+            borderPadding=12,
+            backColor=white,
+        )
+        
+        question_header_style = ParagraphStyle(
+            'QuestionHeaderStyle',
+            parent=styles['Normal'],
+            fontSize=18,
+            spaceAfter=20,
+            fontName='Helvetica-Bold',
+            textColor=white,
+            borderWidth=3,
+            borderColor=primary_color,
+            borderPadding=15,
+            backColor=gradient_start,
+            alignment=TA_CENTER,
+        )
+        
+        question_style = ParagraphStyle(
+            'QuestionStyle',
+            parent=styles['Normal'],
+            fontSize=14,
+            spaceAfter=18,
+            textColor=text_color,
+            fontName='Helvetica',
+            borderWidth=2,
+            borderColor=accent_color,
+            borderPadding=15,
+            backColor=light_color,
+            leftIndent=20,
+            rightIndent=20,
+        )
+        
+        option_style = ParagraphStyle(
+            'OptionStyle',
+            parent=styles['Normal'],
+            fontSize=13,
+            spaceAfter=12,
+            textColor=text_color,
+            fontName='Helvetica',
+            leftIndent=30,
+            rightIndent=20,
+            borderWidth=1,
+            borderColor=secondary_color,
+            borderPadding=10,
+            backColor=white,
+        )
+        
+        answer_style = ParagraphStyle(
+            'AnswerStyle',
+            parent=styles['Normal'],
+            fontSize=13,
+            spaceAfter=15,
+            textColor=primary_color,
+            fontName='Helvetica',
+            borderWidth=2,
+            borderColor=success_color,
+            borderPadding=15,
+            backColor=light_color,
+            leftIndent=20,
+            rightIndent=20,
+        )
+        
+        # Story Elements
+        story = []
+        
+        # Cover Page
+        story.append(DecorativeSeparator(doc.width, 0.2*inch))
+        story.append(Spacer(1, 0.3*inch))
+        
+        story.append(Paragraph("PREMIUM MCQ COLLECTION", title_style))
+        story.append(Spacer(1, 0.2*inch))
+        
+        story.append(Paragraph(f"Subject: {topic.upper()}", subtitle_style))
+        story.append(Spacer(1, 0.3*inch))
+        
+        story.append(DecorativeSeparator(doc.width, 0.15*inch))
+        story.append(Spacer(1, 0.4*inch))
+        
+        # Statistics Table
+        stats_data = [
+            ['COLLECTION ANALYTICS', ''],
+            ['Search Topic', f'{topic}'],
+            ['Total Quality Questions', f'{len(mcqs)}'],
+            ['Smart Filtering Applied', 'Ultra-Premium Topic-based'],
+            ['Generated On', f'{datetime.now().strftime("%B %d, %Y at %I:%M %p")}'],
+            ['Authoritative Source', 'Testbook.com (Premium Grade)'],
+            ['Quality Assurance', 'Professional Excellence'],
+            ['Processing Method', 'Lambda HTTP Enhanced']
+        ]
+        
+        stats_table = Table(stats_data, colWidths=[3*inch, 2.5*inch])
+        
+        stats_table_style = [
+            ('BACKGROUND', (0, 0), (-1, 0), primary_color),
+            ('TEXTCOLOR', (0, 0), (-1, 0), white),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, 0), 14),
+            ('LEFTPADDING', (0, 0), (-1, -1), 15),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 15),
+            ('TOPPADDING', (0, 0), (-1, 0), 15),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 15),
+            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 1), (-1, -1), 12),
+            ('TOPPADDING', (0, 1), (-1, -1), 12),
+            ('BOTTOMPADDING', (0, 1), (-1, -1), 12),
+            ('BACKGROUND', (0, 1), (-1, 1), light_color),
+            ('BACKGROUND', (0, 2), (-1, 2), white),
+            ('BACKGROUND', (0, 3), (-1, 3), light_color),
+            ('BACKGROUND', (0, 4), (-1, 4), white),
+            ('BACKGROUND', (0, 5), (-1, 5), light_color),
+            ('BACKGROUND', (0, 6), (-1, 6), white),
+            ('BACKGROUND', (0, 7), (-1, 7), light_color),
+            ('GRID', (0, 0), (-1, -1), 2, accent_color),
+            ('LINEBELOW', (0, 0), (-1, 0), 3, secondary_color),
+            ('LINEBEFORE', (0, 0), (0, -1), 3, accent_color),
+            ('LINEAFTER', (-1, 0), (-1, -1), 3, accent_color),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('TEXTCOLOR', (0, 1), (-1, -1), text_color),
+            ('TEXTCOLOR', (1, 1), (-1, -1), primary_color),
+        ]
+        
+        stats_table.setStyle(TableStyle(stats_table_style))
+        
+        story.append(stats_table)
+        story.append(Spacer(1, 0.4*inch))
+        story.append(DecorativeSeparator(doc.width, 0.15*inch))
+        story.append(PageBreak())
+        
+        # MCQ Content
+        for i, mcq in enumerate(mcqs, 1):
+            story.append(Paragraph(f"QUESTION {i} OF {len(mcqs)}", question_header_style))
+            story.append(Spacer(1, 0.15*inch))
+            
+            # Exam source
+            exam_info = ""
+            if mcq.exam_source_heading:
+                exam_info = mcq.exam_source_heading
+            elif mcq.exam_source_title:
+                exam_info = mcq.exam_source_title
+            else:
+                exam_info = f"{topic} Practice Question"
+            
+            story.append(Paragraph(f"<i>{exam_info}</i>", 
+                ParagraphStyle('ExamInfo', parent=styles['Normal'], 
+                    fontSize=11, textColor=secondary_color, alignment=TA_CENTER, 
+                    fontName='Helvetica-Oblique', spaceAfter=15,
+                    borderWidth=1, borderColor=accent_color, borderPadding=8, 
+                    backColor=light_color)))
+            
+            story.append(Spacer(1, 0.1*inch))
+            
+            # Question
+            if mcq.question:
+                question_text = mcq.question.replace('\n', '<br/>')
+                story.append(Paragraph(f"<b>QUESTION:</b><br/><br/>{question_text}", question_style))
+            
+            story.append(Spacer(1, 0.15*inch))
+            
+            # Options
+            if mcq.options:
+                for j, option in enumerate(mcq.options, 1):
+                    option_letter = chr(64 + j)
+                    option_text = option.replace('\n', '<br/>')
+                    story.append(Paragraph(f"<b>{option_letter})</b> {option_text}", option_style))
+            
+            story.append(Spacer(1, 0.15*inch))
+            
+            # Answer
+            if mcq.answer:
+                answer_text = mcq.answer.replace('\n', '<br/>')
+                story.append(Paragraph(f"<b>CORRECT ANSWER & EXPLANATION:</b><br/><br/>{answer_text}", answer_style))
+            
+            # Separator between questions
+            if i < len(mcqs):
+                story.append(Spacer(1, 0.3*inch))
+                story.append(DecorativeSeparator(doc.width, 0.1*inch))
+                story.append(PageBreak())
+        
+        # Footer
+        story.append(Spacer(1, 0.5*inch))
+        story.append(DecorativeSeparator(doc.width, 0.2*inch))
+        story.append(Spacer(1, 0.2*inch))
+        
+        story.append(Paragraph("<b>PREMIUM COLLECTION COMPLETE</b>", 
+            ParagraphStyle('FooterTitle', parent=styles['Normal'], 
+                fontSize=16, alignment=TA_CENTER, textColor=gold_color,
+                fontName='Helvetica-Bold', spaceAfter=15)))
+        
+        story.append(Paragraph(f"Generated by HEMANT SINGH", 
+            ParagraphStyle('CreditSubtext', parent=styles['Normal'], 
+                fontSize=14, alignment=TA_CENTER, textColor=accent_color,
+                fontName='Helvetica-Oblique')))
+        
+        story.append(Spacer(1, 0.5*inch))
+        story.append(DecorativeSeparator(doc.width, 0.2*inch))
+        
+        # Build PDF
+        doc.build(story)
+        
+        print(f"✅ BEAUTIFUL PROFESSIONAL PDF generated successfully: {filename} with {len(mcqs)} MCQs")
+        return filename
+        
+    except Exception as e:
+        print(f"❌ Error generating beautiful PDF: {e}")
+        raise
+
+# Enhanced concurrent processing for Lambda
+async def process_mcq_extraction(job_id: str, topic: str, exam_type: str = "SSC", pdf_format: str = "text"):
+    """Enhanced MCQ extraction with 30 concurrent processes"""
+    try:
+        update_job_progress(job_id, "running", f"[SEARCH] Searching for {exam_type} '{topic}' results with ultra-smart filtering...")
+        
+        # Search for links
+        links = await search_google_custom(topic, exam_type)
+        
+        if not links:
+            update_job_progress(job_id, "completed", f"[ERROR] No {exam_type} results found for '{topic}'. Please try another topic.", 
+                              total_links=0, processed_links=0, mcqs_found=0)
+            return
+        
+        update_job_progress(job_id, "running", f"[SUCCESS] Found {len(links)} {exam_type} links. Starting concurrent extraction with 30 processes...", 
+                          total_links=len(links))
+        
+        # Process with concurrent scraping
+        await process_concurrent_extraction(job_id, topic, exam_type, links, pdf_format)
+        
+    except Exception as e:
+        error_message = str(e)
+        print(f"❌ Critical error in process_mcq_extraction: {e}")
+        update_job_progress(job_id, "error", f"[ERROR] Error: {error_message}")
+
+async def process_concurrent_extraction(job_id: str, topic: str, exam_type: str, links: List[str], pdf_format: str):
+    """Process extraction with 30 concurrent workers"""
+    try:
+        await http_scraper.initialize()
+        
+        print(f"🚀 Starting concurrent processing with {http_scraper.max_concurrent_processes} workers: {len(links)} links")
+        
+        # Create concurrent tasks
+        tasks = []
+        for i, url in enumerate(links):
+            task = http_scraper.scrape_testbook_page_concurrent(url, topic, exam_type)
+            tasks.append(task)
+        
+        # Process in batches to avoid overwhelming the system
+        batch_size = 30
+        all_results = []
+        
+        for i in range(0, len(tasks), batch_size):
+            batch_tasks = tasks[i:i+batch_size]
+            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            
+            # Filter successful results
+            successful_results = [r for r in batch_results if r is not None and not isinstance(r, Exception)]
+            all_results.extend(successful_results)
+            
+            # Update progress
+            processed_count = min(i + batch_size, len(links))
+            update_job_progress(job_id, "running", 
+                              f"[PROCESSING] Processed {processed_count}/{len(links)} links - Found {len(all_results)} relevant MCQs", 
+                              processed_links=processed_count, mcqs_found=len(all_results))
+            
+            print(f"✅ Batch {i//batch_size + 1} completed: {len(successful_results)} MCQs found")
+        
+        await http_scraper.close()
+        
+        if not all_results:
+            update_job_progress(job_id, "completed", 
+                              f"[ERROR] No relevant MCQs found for '{topic}' and exam type '{exam_type}' across {len(links)} links.", 
+                              total_links=len(links), processed_links=len(links), mcqs_found=0)
+            return
+        
+        # Generate PDF
+        final_message = f"[SUCCESS] Concurrent processing complete! Found {len(all_results)} relevant MCQs from {len(links)} total links."
+        update_job_progress(job_id, "running", final_message + " Generating PDF...", 
+                          total_links=len(links), processed_links=len(links), mcqs_found=len(all_results))
+        
+        try:
+            # Convert results to MCQData objects
+            mcqs = []
+            for result in all_results:
+                if isinstance(result, dict) and result.get('question'):
+                    mcq = MCQData(
+                        question=result['question'],
+                        options=result.get('options', []),
+                        answer=result.get('answer', ''),
+                        exam_source_heading=result.get('exam_source_heading', ''),
+                        exam_source_title=result.get('exam_source_title', ''),
+                        is_relevant=result.get('is_relevant', True)
+                    )
+                    mcqs.append(mcq)
+            
+            filename = generate_pdf(mcqs, topic, job_id, len(all_results), 0, len(links))
+            
+            # Handle S3 upload for Lambda
+            if LAMBDA_S3_INTEGRATION:
+                pdf_path = get_pdf_directory() / filename
+                pdf_url = upload_pdf_to_s3_lambda(str(pdf_path), job_id, topic, exam_type)
+                if not pdf_url:
+                    pdf_url = f"/api/download-pdf/{filename}"
+            else:
+                pdf_url = f"/api/download-pdf/{filename}"
+            
+            generated_pdfs[job_id] = {
+                "filename": filename,
+                "topic": topic,
+                "exam_type": exam_type,
+                "mcqs_count": len(mcqs),
+                "generated_at": datetime.now()
+            }
+            
+            success_message = f"[DONE] SUCCESS! Generated PDF with {len(mcqs)} relevant MCQs for topic '{topic}' and exam type '{exam_type}' using {http_scraper.max_concurrent_processes} concurrent processes."
+            update_job_progress(job_id, "completed", success_message, 
+                              total_links=len(links), processed_links=len(links), 
+                              mcqs_found=len(mcqs), pdf_url=pdf_url)
+            
+            print(f"✅ Job {job_id} completed successfully with {len(mcqs)} MCQs using concurrent processing")
+            
+        except Exception as e:
+            print(f"❌ Error generating PDF: {e}")
+            update_job_progress(job_id, "error", f"[ERROR] Error generating PDF: {str(e)}")
+    
+    except Exception as e:
+        print(f"❌ Critical error in concurrent extraction: {e}")
+        update_job_progress(job_id, "error", f"[ERROR] Critical error: {str(e)}")
+        await http_scraper.close()
+
 # FastAPI App Configuration
-app = FastAPI(title="MCQ Scraper API", version="4.0.0")
+app = FastAPI(title="Lambda MCQ Scraper", version="4.0.0")
 
 # CORS Configuration
 app.add_middleware(
@@ -521,453 +1180,162 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Data Models
-class MCQData(BaseModel):
-    question: str
-    options: List[str]
-    answer: str
-    exam_source_heading: str = ""
-    exam_source_title: str = ""
-    is_relevant: bool = True
-
-class ScrapeRequest(BaseModel):
-    topic: str
-    exam_type: str = "SSC"
-    max_mcqs: int = 50
-
-class JobResponse(BaseModel):
-    job_id: str
-    status: str
-    message: str
-
-class JobStatusResponse(BaseModel):
-    job_id: str
-    status: str
-    progress: str
-    total_links: int = 0
-    processed_links: int = 0
-    mcqs_found: int = 0
-    pdf_url: Optional[str] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-
 # API Endpoints
 @app.get("/")
 async def read_root():
     """Root endpoint"""
     return {
-        "message": "MCQ Scraper API", 
+        "message": "Lambda MCQ Scraper API", 
         "version": "4.0.0",
-        "approach": "http_requests_scraping",
+        "approach": "lambda_http_requests_scraping",
         "browser_required": False,
+        "concurrent_processes": 30,
         "status": "running",
         "available_endpoints": [
             "GET /api/health",
-            "POST /api/scrape-mcqs",
+            "POST /api/generate-mcq-pdf",
             "GET /api/job-status/{job_id}",
-            "GET /api/download-pdf/{job_id}"
+            "GET /api/download-pdf/{filename}",
+            "GET /api/test-search"
         ]
     }
 
-@app.get("/api/test-search")
-async def test_search_functionality():
-    """Test search functionality and API configuration"""
-    try:
-        # Test API key availability
-        api_status = {
-            "api_keys_available": len(api_key_manager.api_keys) > 0,
-            "total_api_keys": len(api_key_manager.api_keys),
-            "search_engine_id": SEARCH_ENGINE_ID
-        }
-        
-        # Test a simple search
-        test_urls = await search_mcq_urls("Mathematics", "SSC", 3)
-        
-        return {
-            "status": "success",
-            "api_configuration": api_status,
-            "test_search_results": {
-                "urls_found": len(test_urls),
-                "sample_urls": test_urls[:3] if test_urls else [],
-                "search_method": "google_custom_search" if api_status["api_keys_available"] else "fallback_urls"
-            }
-        }
-        
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "api_configuration": {
-                "api_keys_available": False,
-                "total_api_keys": 0,
-                "search_engine_id": SEARCH_ENGINE_ID
-            }
-        }
-
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint with HTTP scraping status"""
+    """Health check endpoint"""
     try:
-        from health_check import get_health_status
-        return await get_health_status()
+        scraper_stats = http_scraper.get_stats()
+        return {
+            "status": "healthy",
+            "version": "4.0.0",
+            "approach": "lambda_http_requests_scraping",
+            "browser_required": False,
+            "lambda_compatible": True,
+            "concurrent_processes": http_scraper.max_concurrent_processes,
+            "scraping_status": scraper_stats,
+            "active_jobs": len(persistent_storage.jobs),
+            "s3_integration": LAMBDA_S3_INTEGRATION,
+            "api_keys_available": len(api_key_manager.api_keys),
+            "timestamp": datetime.now().isoformat()
+        }
     except Exception as e:
         return {
             "status": "error",
             "version": "4.0.0",
-            "approach": "http_requests_scraping",
+            "approach": "lambda_http_requests_scraping",
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
 
-@app.post("/api/scrape-mcqs")
-async def scrape_mcqs(request: ScrapeRequest, background_tasks: BackgroundTasks):
-    """Start MCQ scraping job"""
+@app.get("/api/test-search")
+async def test_search_functionality():
+    """Test search functionality"""
     try:
-        # Generate unique job ID
-        job_id = str(uuid.uuid4())
+        # Test search with sample data
+        test_urls = await search_google_custom("Mathematics", "SSC")
         
-        # Initialize job in persistent storage
-        persistent_storage.update_job(
-            job_id=job_id,
-            status="started",
-            progress="Initializing MCQ scraping job...",
-            total_links=0,
-            processed_links=0,
-            mcqs_found=0
-        )
-        
-        # Start background scraping task
-        background_tasks.add_task(
-            process_mcq_scraping_job,
-            job_id=job_id,
-            topic=request.topic,
-            exam_type=request.exam_type,
-            max_mcqs=request.max_mcqs
-        )
-        
-        return JobResponse(
-            job_id=job_id,
-            status="started",
-            message=f"MCQ scraping job started for topic '{request.topic}' and exam type '{request.exam_type}'"
-        )
-        
+        return {
+            "status": "success",
+            "api_keys_available": len(api_key_manager.api_keys),
+            "search_engine_id": SEARCH_ENGINE_ID,
+            "test_search_results": {
+                "urls_found": len(test_urls),
+                "sample_urls": test_urls[:3] if test_urls else [],
+                "concurrent_processing": "30 processes"
+            },
+            "scraper_stats": http_scraper.get_stats()
+        }
     except Exception as e:
-        logger.error(f"Error starting MCQ scraping job: {e}")
-        raise HTTPException(status_code=500, detail=f"Error starting scraping job: {str(e)}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "api_keys_available": len(api_key_manager.api_keys)
+        }
+
+@app.post("/api/generate-mcq-pdf")
+async def generate_mcq_pdf(request: SearchRequest, background_tasks: BackgroundTasks):
+    """Generate MCQ PDF with concurrent processing"""
+    job_id = str(uuid.uuid4())
+    
+    # Validate inputs
+    if not request.topic.strip():
+        raise HTTPException(status_code=400, detail="Topic is required")
+    
+    if request.exam_type not in ["SSC", "BPSC"]:
+        raise HTTPException(status_code=400, detail="Exam type must be SSC or BPSC")
+    
+    if request.pdf_format not in ["text", "image"]:
+        raise HTTPException(status_code=400, detail="PDF format must be 'text' or 'image'")
+    
+    # Initialize job progress
+    update_job_progress(
+        job_id, 
+        "running", 
+        f"[STARTING] Starting Lambda {request.exam_type} MCQ extraction for '{request.topic}' with 30 concurrent processes..."
+    )
+    
+    # Start background task
+    background_tasks.add_task(
+        process_mcq_extraction,
+        job_id=job_id,
+        topic=request.topic.strip(),
+        exam_type=request.exam_type,
+        pdf_format=request.pdf_format
+    )
+    
+    return {"job_id": job_id, "status": "started"}
 
 @app.get("/api/job-status/{job_id}")
 async def get_job_status(job_id: str):
-    """Get job status and progress"""
-    try:
-        job_data = persistent_storage.get_job(job_id)
-        
-        if not job_data:
-            raise HTTPException(status_code=404, detail="Job not found")
-        
-        return JobStatusResponse(**job_data)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting job status: {e}")
-        raise HTTPException(status_code=500, detail=f"Error getting job status: {str(e)}")
+    """Get job status"""
+    job_data = persistent_storage.get_job(job_id)
+    
+    if not job_data:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    return JobStatus(**job_data)
 
-@app.get("/api/download-pdf/{job_id}")
-async def download_pdf(job_id: str):
+@app.get("/api/download-pdf/{filename}")
+async def download_pdf(filename: str):
     """Download generated PDF"""
     try:
-        job_data = persistent_storage.get_job(job_id)
+        pdf_dir = get_pdf_directory()
+        file_path = pdf_dir / filename
         
-        if not job_data:
-            raise HTTPException(status_code=404, detail="Job not found")
+        if not file_path.exists():
+            print(f"❌ PDF file not found: {file_path}")
+            raise HTTPException(status_code=404, detail="PDF file not found")
         
-        pdf_url = job_data.get('pdf_url')
-        if not pdf_url:
-            raise HTTPException(status_code=404, detail="PDF not available yet")
-        
-        # For Lambda with S3 integration, return the S3 URL
-        return {"download_url": pdf_url}
+        print(f"✅ Serving PDF file: {file_path}")
+        return FileResponse(
+            path=str(file_path),
+            filename=filename,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error downloading PDF: {e}")
-        raise HTTPException(status_code=500, detail=f"Error downloading PDF: {str(e)}")
+        print(f"❌ Error serving PDF file: {e}")
+        raise HTTPException(status_code=500, detail="Error serving PDF file")
 
-# Background task function
-async def process_mcq_scraping_job(job_id: str, topic: str, exam_type: str, max_mcqs: int):
-    """Process MCQ scraping job in background"""
+@app.get("/api/cleanup-old-jobs")
+async def cleanup_old_jobs():
+    """Manual cleanup of old jobs"""
     try:
-        # Initialize HTTP scraper
-        if not http_scraper.is_initialized:
-            http_scraper.initialize()
-        
-        # Update job status
-        persistent_storage.update_job(
-            job_id=job_id,
-            status="searching",
-            progress="Searching for MCQ sources...",
-            total_links=0,
-            processed_links=0,
-            mcqs_found=0
-        )
-        
-        # Search for MCQ URLs using Google Custom Search
-        search_urls = await search_mcq_urls(topic, exam_type, max_mcqs)
-        
-        if not search_urls:
-            persistent_storage.update_job(
-                job_id=job_id,
-                status="failed",
-                progress="No MCQ sources found",
-                total_links=0,
-                processed_links=0,
-                mcqs_found=0
-            )
-            return
-        
-        # Update job with search results
-        persistent_storage.update_job(
-            job_id=job_id,
-            status="scraping",
-            progress="Scraping MCQs from sources...",
-            total_links=len(search_urls),
-            processed_links=0,
-            mcqs_found=0
-        )
-        
-        # Scrape MCQs from URLs
-        mcqs = []
-        processed_count = 0
-        
-        for url in search_urls:
-            try:
-                mcq_data = await http_scraper.scrape_mcq_page(url, topic, exam_type)
-                if mcq_data:
-                    mcqs.append(mcq_data)
-                
-                processed_count += 1
-                
-                # Update progress
-                persistent_storage.update_job(
-                    job_id=job_id,
-                    status="scraping",
-                    progress=f"Scraped {processed_count}/{len(search_urls)} sources...",
-                    total_links=len(search_urls),
-                    processed_links=processed_count,
-                    mcqs_found=len(mcqs)
-                )
-                
-                # Stop if we have enough MCQs
-                if len(mcqs) >= max_mcqs:
-                    break
-                    
-            except Exception as e:
-                logger.error(f"Error scraping URL {url}: {e}")
-                continue
-        
-        if not mcqs:
-            persistent_storage.update_job(
-                job_id=job_id,
-                status="failed",
-                progress="No MCQs found",
-                total_links=len(search_urls),
-                processed_links=processed_count,
-                mcqs_found=0
-            )
-            return
-        
-        # Generate PDF
-        persistent_storage.update_job(
-            job_id=job_id,
-            status="generating_pdf",
-            progress="Generating PDF...",
-            total_links=len(search_urls),
-            processed_links=processed_count,
-            mcqs_found=len(mcqs)
-        )
-        
-        pdf_url = await generate_mcq_pdf(mcqs, topic, exam_type, job_id)
-        
-        if pdf_url:
-            persistent_storage.update_job(
-                job_id=job_id,
-                status="completed",
-                progress="PDF generated successfully",
-                total_links=len(search_urls),
-                processed_links=processed_count,
-                mcqs_found=len(mcqs),
-                pdf_url=pdf_url
-            )
-        else:
-            persistent_storage.update_job(
-                job_id=job_id,
-                status="failed",
-                progress="PDF generation failed",
-                total_links=len(search_urls),
-                processed_links=processed_count,
-                mcqs_found=len(mcqs)
-            )
-            
+        persistent_storage.cleanup_old_jobs()
+        return {"message": "Old jobs cleaned up successfully", "remaining_jobs": len(persistent_storage.jobs)}
     except Exception as e:
-        logger.error(f"Error processing MCQ scraping job {job_id}: {e}")
-        persistent_storage.update_job(
-            job_id=job_id,
-            status="failed",
-            progress=f"Job failed: {str(e)}",
-            total_links=0,
-            processed_links=0,
-            mcqs_found=0
-        )
-
-# Helper functions
-async def search_mcq_urls(topic: str, exam_type: str, max_mcqs: int) -> List[str]:
-    """Search for MCQ URLs using Google Custom Search with fallback"""
-    try:
-        # First try Google Custom Search API
-        urls = await try_google_custom_search(topic, exam_type, max_mcqs)
-        
-        if urls:
-            logger.info(f"Found {len(urls)} URLs via Google Custom Search")
-            return urls
-        
-        # Fallback to predefined MCQ sites
-        logger.warning("Google Custom Search failed, using fallback URLs")
-        return get_fallback_mcq_urls(topic, exam_type, max_mcqs)
-        
-    except Exception as e:
-        logger.error(f"Error in search_mcq_urls: {e}")
-        return get_fallback_mcq_urls(topic, exam_type, max_mcqs)
-
-async def try_google_custom_search(topic: str, exam_type: str, max_mcqs: int) -> List[str]:
-    """Try Google Custom Search API"""
-    try:
-        # Check if API key is available
-        if not api_key_manager.api_keys:
-            logger.warning("No Google API keys available")
-            return []
-        
-        # Construct search query
-        query = f"{topic} MCQ {exam_type} questions answers"
-        
-        # Use Google Custom Search API
-        api_key = api_key_manager.get_current_key()
-        search_url = "https://www.googleapis.com/customsearch/v1"
-        
-        params = {
-            'key': api_key,
-            'cx': SEARCH_ENGINE_ID,
-            'q': query,
-            'num': min(max_mcqs, 10)  # Max 10 results per request
-        }
-        
-        logger.info(f"Searching Google Custom Search for: {query}")
-        response = requests.get(search_url, params=params, timeout=15)
-        
-        if response.status_code == 403:
-            logger.error("Google API quota exceeded or invalid API key")
-            return []
-        
-        response.raise_for_status()
-        data = response.json()
-        
-        urls = []
-        for item in data.get('items', []):
-            urls.append(item['link'])
-        
-        logger.info(f"Google Custom Search returned {len(urls)} URLs")
-        return urls
-        
-    except Exception as e:
-        logger.error(f"Google Custom Search error: {e}")
-        return []
-
-def get_fallback_mcq_urls(topic: str, exam_type: str, max_mcqs: int) -> List[str]:
-    """Get fallback MCQ URLs when Google Search fails"""
-    # Popular MCQ websites with topic-specific URLs
-    fallback_sites = [
-        f"https://www.examveda.com/{topic.lower()}-mcq-questions-answers/",
-        f"https://www.indiabix.com/{topic.lower()}-questions-and-answers/",
-        f"https://www.freshersworld.com/{topic.lower()}-questions-and-answers/",
-        f"https://www.geeksforgeeks.org/{topic.lower()}-multiple-choice-questions/",
-        f"https://www.javatpoint.com/{topic.lower()}-mcq",
-        f"https://www.sanfoundry.com/{topic.lower()}-questions-answers/",
-        f"https://www.tutorialspoint.com/{topic.lower()}-questions-answers/",
-        f"https://www.studytonight.com/{topic.lower()}-mcqs/",
-        f"https://www.careerride.com/{topic.lower()}-mcqs/",
-        f"https://www.youth4work.com/{topic.lower()}-mcq-questions/"
-    ]
-    
-    # Filter by exam type if SSC
-    if exam_type.lower() == "ssc":
-        ssc_sites = [
-            f"https://www.sscadda.com/{topic.lower()}-questions-for-ssc-exams/",
-            f"https://www.oliveboard.in/ssc/{topic.lower()}-questions/",
-            f"https://www.testbook.com/ssc/{topic.lower()}-questions/",
-            f"https://www.gradeup.co/ssc/{topic.lower()}-questions/",
-            f"https://www.jagran.com/ssc/{topic.lower()}-mcq/"
-        ]
-        fallback_sites.extend(ssc_sites)
-    
-    # Return limited number of URLs
-    return fallback_sites[:min(max_mcqs, 10)]
-
-async def generate_mcq_pdf(mcqs: List[dict], topic: str, exam_type: str, job_id: str) -> Optional[str]:
-    """Generate PDF from MCQs"""
-    try:
-        # Get PDF directory
-        pdf_dir = get_pdf_directory()
-        
-        # Create PDF filename
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pdf_filename = f"mcq_{topic.replace(' ', '_')}_{exam_type}_{timestamp}.pdf"
-        pdf_path = pdf_dir / pdf_filename
-        
-        # Generate PDF using ReportLab
-        doc = SimpleDocTemplate(str(pdf_path), pagesize=A4)
-        story = []
-        styles = getSampleStyleSheet()
-        
-        # Title
-        title = Paragraph(f"MCQ Questions - {topic} ({exam_type})", styles['Title'])
-        story.append(title)
-        story.append(Spacer(1, 20))
-        
-        # Add MCQs
-        for i, mcq in enumerate(mcqs, 1):
-            # Question
-            question = Paragraph(f"<b>Q{i}.</b> {mcq['question']}", styles['Normal'])
-            story.append(question)
-            story.append(Spacer(1, 10))
-            
-            # Options
-            for j, option in enumerate(mcq.get('options', []), 1):
-                option_text = Paragraph(f"  {chr(64+j)}. {option}", styles['Normal'])
-                story.append(option_text)
-            
-            story.append(Spacer(1, 10))
-            
-            # Answer
-            if mcq.get('answer'):
-                answer = Paragraph(f"<b>Answer:</b> {mcq['answer']}", styles['Normal'])
-                story.append(answer)
-            
-            story.append(Spacer(1, 20))
-        
-        # Build PDF
-        doc.build(story)
-        
-        # Upload to S3 if in Lambda environment
-        if LAMBDA_S3_INTEGRATION:
-            pdf_url = upload_pdf_to_s3_lambda(str(pdf_path), job_id, topic, exam_type)
-            return pdf_url
-        else:
-            return str(pdf_path)
-            
-    except Exception as e:
-        logger.error(f"Error generating PDF: {e}")
-        return None
+        print(f"❌ Error cleaning up old jobs: {e}")
+        raise HTTPException(status_code=500, detail="Error cleaning up old jobs")
 
 print("============================================================")
-print("MCQ SCRAPER - HTTP SCRAPING FINAL VERSION")
+print("LAMBDA MCQ SCRAPER - HTTP ENHANCED VERSION")
+print("============================================================")
+print("✅ 30 Concurrent Processes Support")
+print("✅ Lambda-Compatible HTTP Scraping")
+print("✅ Beautiful PDF Generation")
+print("✅ Testbook.com Integration")
+print("✅ S3 Storage Support")
 print("============================================================")
