@@ -1,21 +1,13 @@
-# PRODUCTION AWS Lambda Dockerfile - ALTERNATIVE CHROME BINARY APPROACH
+# PRODUCTION AWS Lambda Dockerfile - COMPLETE CHROME BINARY SOLUTION
 FROM public.ecr.aws/lambda/python:3.11
 
-# Install system dependencies for Chrome
+# Install system dependencies for Chrome (optimized for Lambda)
 RUN yum update -y && \
     yum install -y \
     wget \
     unzip \
     curl \
-    xz \
-    tar \
-    gzip \
     which \
-    at-spi2-atk \
-    cups-libs \
-    gtk3 \
-    ipa-gothic-fonts \
-    libdrm \
     libX11 \
     libXcomposite \
     libXcursor \
@@ -26,41 +18,48 @@ RUN yum update -y && \
     libXrender \
     libXss \
     libXtst \
-    xorg-x11-server-Xvfb \
     nss \
     nspr \
     atk \
     at-spi2-atk \
+    cups-libs \
+    libdrm \
+    gtk3 \
     libxkbcommon \
     && yum clean all
 
-# Set Chrome-compatible environment variables
+# Set Chrome-optimized environment variables
 ENV CHROME_BINARY_PATH=/opt/chrome/chrome
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/chrome
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV PYTHONPATH=/opt/python:/var/task
+ENV BROWSER_APPROACH=chrome_binary
 
-# Create required directories
+# Create required directories with proper permissions
 RUN mkdir -p /opt/chrome /tmp/pdfs /var/task && \
     chmod -R 755 /opt/chrome && \
     chmod -R 777 /tmp
-
-# Download and install Chrome for Amazon Linux (compatible version)
-RUN cd /opt && \
-    # Download Chromium compatible with Amazon Linux 2
-    wget -q https://github.com/adieuadieu/serverless-chrome/releases/download/v1.0.0-57/stable-headless-chromium-amazonlinux-2.zip && \
-    unzip stable-headless-chromium-amazonlinux-2.zip && \
-    mv headless-chromium /opt/chrome/chrome && \
-    chmod +x /opt/chrome/chrome && \
-    rm stable-headless-chromium-amazonlinux-2.zip && \
-    # Verify Chrome installation
-    /opt/chrome/chrome --version || echo "Chrome installation warning - will retry at runtime"
 
 # Copy requirements first for better Docker layer caching
 COPY requirements-lambda.txt .
 
 # Install Python dependencies to Lambda layer directory
 RUN pip install --no-cache-dir --target /opt/python -r requirements-lambda.txt
+
+# Download and install Chrome binary for Amazon Linux 2
+RUN cd /tmp && \
+    # Download compatible Chrome binary
+    wget -q -O chrome.zip https://github.com/adieuadieu/serverless-chrome/releases/download/v1.0.0-57/stable-headless-chromium-amazonlinux-2.zip && \
+    # Extract Chrome binary
+    unzip -q chrome.zip && \
+    # Move to final location
+    mv headless-chromium /opt/chrome/chrome && \
+    # Set proper permissions
+    chmod +x /opt/chrome/chrome && \
+    # Clean up
+    rm chrome.zip && \
+    # Verify installation
+    /opt/chrome/chrome --version --no-sandbox --disable-gpu || echo "Chrome verification will retry at runtime"
 
 # Copy application code to Lambda task directory
 COPY server.py competitive_exam_keywords.py health_check.py ./
@@ -71,13 +70,15 @@ COPY s3_production_integration.py ./
 # Set proper executable permissions  
 RUN chmod +x lambda_handler_production.py install_playwright.py post_deploy_setup.py
 
-# Create Chrome verification script
+# Create Chrome startup verification script
 RUN echo '#!/bin/bash\n\
-echo "Testing Chrome binary..."\n\
-/opt/chrome/chrome --version\n\
-echo "Chrome verification completed"' > /opt/verify_chrome.sh && \
-    chmod +x /opt/verify_chrome.sh && \
-    /opt/verify_chrome.sh || echo "⚠️ Chrome verification failed, will retry at runtime"
+echo "=== Chrome Binary Verification ==="\n\
+/opt/chrome/chrome --version --no-sandbox --disable-gpu\n\
+echo "=== Verification Complete ==="' > /opt/verify_chrome.sh && \
+    chmod +x /opt/verify_chrome.sh
+
+# Run verification during build
+RUN /opt/verify_chrome.sh || echo "⚠️ Chrome verification failed during build, will retry at runtime"
 
 # Set the Lambda handler
 CMD ["lambda_handler_production.handler"]
