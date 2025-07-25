@@ -19,6 +19,24 @@ jobs:
     - name: 📥 Checkout code
       uses: actions/checkout@v4
       
+    - name: 🔍 Debug secrets (remove after fixing)
+      run: |
+        echo "Checking if secrets are available..."
+        if [ -z "${{ secrets.AWS_ACCESS_KEY_ID }}" ]; then
+          echo "❌ AWS_ACCESS_KEY_ID secret is missing or empty"
+        else
+          echo "✅ AWS_ACCESS_KEY_ID secret exists (length: ${#AWS_ACCESS_KEY_ID})"
+        fi
+        
+        if [ -z "${{ secrets.AWS_SECRET_ACCESS_KEY }}" ]; then
+          echo "❌ AWS_SECRET_ACCESS_KEY secret is missing or empty"
+        else
+          echo "✅ AWS_SECRET_ACCESS_KEY secret exists (length: ${#AWS_SECRET_ACCESS_KEY})"
+        fi
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        
     - name: 🔐 Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v2
       with:
@@ -69,13 +87,13 @@ jobs:
         echo "Docker image pushed successfully!"
         echo "IMAGE_URI=$ECR_REPOSITORY_URI:$IMAGE_TAG" >> $GITHUB_ENV
         
-    - name: ⚡ Update Lambda function
+    - name: ⚡ Create or Update Lambda function
       run: |
-        echo "Updating Lambda function code..."
+        echo "Checking if Lambda function exists..."
         
         # Check if Lambda function exists
         if aws lambda get-function --function-name $LAMBDA_FUNCTION_NAME 2>/dev/null; then
-          echo "Lambda function exists, updating code..."
+          echo "✅ Lambda function exists, updating code..."
           aws lambda update-function-code \
             --function-name $LAMBDA_FUNCTION_NAME \
             --image-uri $IMAGE_URI
@@ -94,15 +112,41 @@ jobs:
               ENVIRONMENT=lambda
             }"
         else
-          echo "❌ Lambda function $LAMBDA_FUNCTION_NAME does not exist!"
-          echo "Please create the Lambda function manually in AWS Console first."
-          echo "Use the following settings:"
-          echo "  - Function name: $LAMBDA_FUNCTION_NAME"
-          echo "  - Container image URI: $IMAGE_URI"
-          echo "  - Execution role: mcq-scraper-lambda-role"
-          echo "  - Memory: 3008 MB"
-          echo "  - Timeout: 15 minutes"
-          exit 1
+          echo "🆕 Lambda function doesn't exist, creating it..."
+          
+          # Get the IAM role ARN
+          ROLE_ARN=$(aws iam get-role --role-name mcq-scraper-lambda-role --query 'Role.Arn' --output text 2>/dev/null || echo "")
+          
+          if [ -z "$ROLE_ARN" ]; then
+            echo "❌ IAM role 'mcq-scraper-lambda-role' not found!"
+            echo "Please create the IAM role first with these policies:"
+            echo "  - AWSLambdaBasicExecutionRole"
+            echo "  - AmazonS3FullAccess"
+            echo "  - SecretsManagerReadWrite"
+            exit 1
+          fi
+          
+          echo "✅ Found IAM role: $ROLE_ARN"
+          
+          # Create Lambda function
+          aws lambda create-function \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --code ImageUri=$IMAGE_URI \
+            --role $ROLE_ARN \
+            --package-type Image \
+            --timeout 900 \
+            --memory-size 3008 \
+            --environment Variables="{
+              PDF_BUCKET_NAME=${{ secrets.PDF_BUCKET_NAME }},
+              PLAYWRIGHT_BROWSERS_PATH=/opt/python/pw-browsers,
+              ENVIRONMENT=lambda
+            }" \
+            --description "MCQ Scraper backend deployed via GitHub Actions"
+            
+          echo "⏳ Waiting for function to be active..."
+          aws lambda wait function-active --function-name $LAMBDA_FUNCTION_NAME
+          
+          echo "✅ Lambda function created successfully!"
         fi
         
     - name: 🧪 Test Lambda function
