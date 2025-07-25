@@ -1,0 +1,64 @@
+# Production AWS Lambda Dockerfile
+FROM public.ecr.aws/lambda/python:3.11
+
+# Install system dependencies for Playwright
+RUN yum update -y && \
+    yum install -y \
+    wget \
+    unzip \
+    curl \
+    xz \
+    tar \
+    gzip \
+    libX11 \
+    libXcomposite \
+    libXcursor \
+    libXdamage \
+    libXext \
+    libXi \
+    libXrandr \
+    libXrender \
+    libXss \
+    libXtst \
+    libxcb \
+    libdrm \
+    libxkbcommon \
+    libatspi \
+    libnss3 \
+    libgtk-3 \
+    libasound2 \
+    libgcc \
+    fontconfig \
+    freetype && \
+    yum clean all
+
+# Set Playwright environment variables
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/python/pw-browsers
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
+ENV PYTHONPATH=/opt/python:/var/task
+
+# Create directories
+RUN mkdir -p /opt/python/pw-browsers /tmp/pdfs
+
+# Copy requirements first for better Docker layer caching
+COPY requirements-lambda.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --target /opt/python -r requirements-lambda.txt
+
+# Install Playwright browsers in the correct location
+RUN cd /opt/python && \
+    python -m playwright install chromium --with-deps && \
+    find /opt/python/pw-browsers -name "*.so*" -exec strip {} \; 2>/dev/null || true
+
+# Copy application code
+COPY server.py competitive_exam_keywords.py health_check.py ./
+COPY install_playwright.py post_deploy_setup.py ./
+COPY lambda_handler_production.py ./
+COPY s3_lambda_integration.py ./
+
+# Set executable permissions
+RUN chmod +x lambda_handler_production.py
+
+# Set the Lambda handler
+CMD ["lambda_handler_production.handler"]
