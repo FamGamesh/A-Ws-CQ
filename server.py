@@ -534,7 +534,13 @@ class StealthRateLimitManager:
                     'https://testbook.com/'
                 ])
             
-            timeout = aiohttp.ClientTimeout(total=30, connect=15)
+            # Create timeout configuration with proper connection timeout
+            timeout = aiohttp.ClientTimeout(
+                total=30, 
+                connect=random.uniform(10, 15),  # Connection timeout moved to ClientTimeout
+                sock_read=20,
+                sock_connect=15
+            )
             connector = aiohttp.TCPConnector(
                 limit=20,
                 limit_per_host=5,
@@ -599,16 +605,11 @@ class StealthRateLimitManager:
                 if not session:
                     return False, None, 0
                 
-                # Apply smart delay before request
+                # Apply smart delay before request (removed - stealth methods already sufficient)
                 if attempt > 0:
-                    await self.smart_delay('retry_delay', url)
-                elif retry_count > 0:
-                    await self.smart_delay('base_delay', url)
-                else:
-                    # Small delay for first attempts
-                    await asyncio.sleep(random.uniform(0.5, 2.0))
+                    await asyncio.sleep(0.5)  # Minimal delay for retries only
                 
-                print(f"🕵️ Stealth request attempt {attempt + 1} (retry #{retry_count}): {url}")
+                print(f"🕵️ Stealth request attempt {attempt + 1}: {url}")
                 
                 async with session.get(url) as response:
                     if response.status == 200:
@@ -625,36 +626,23 @@ class StealthRateLimitManager:
                         print(f"🚫 Rate limited (429) on attempt {attempt + 1}: {url}")
                         self.failed_urls.add(url)
                         
-                        # Exponential backoff for rate limits
-                        backoff_delay = min(30 + (retry_count * 10), 120)  # Max 2 minutes
-                        print(f"⏸️ Rate limit backoff: {backoff_delay}s")
-                        await asyncio.sleep(backoff_delay)
-                        
-                        # Try with a different session
+                        # Try with a different session (removed extensive delays)
                         continue
                     
                     elif response.status in [403, 404, 502, 503]:
                         print(f"⚠️ HTTP {response.status} on attempt {attempt + 1}: {url}")
-                        if attempt < max_attempts - 1:
-                            await self.smart_delay('retry_delay', url)
                         continue
                     
                     else:
                         print(f"❌ Unexpected status {response.status}: {url}")
-                        if attempt < max_attempts - 1:
-                            await self.smart_delay('retry_delay', url)
                         continue
             
             except asyncio.TimeoutError:
                 print(f"⏱️ Timeout on attempt {attempt + 1}: {url}")
-                if attempt < max_attempts - 1:
-                    await self.smart_delay('retry_delay', url)
                 continue
                 
             except Exception as e:
                 print(f"💥 Error on attempt {attempt + 1} for {url}: {str(e)}")
-                if attempt < max_attempts - 1:
-                    await self.smart_delay('retry_delay', url)
                 continue
         
         # All attempts failed - add to retry queue
@@ -887,9 +875,6 @@ class PuppeteerScreenshotManager:
                 });
             ''')
             
-            # Random delay before navigation (human-like behavior)
-            await asyncio.sleep(random.uniform(0.5, 2.0))
-            
             # Navigate with extended timeout for rate-limited responses
             try:
                 await asyncio.wait_for(
@@ -904,8 +889,8 @@ class PuppeteerScreenshotManager:
                 print(f"⏱️ Navigation timeout for {url}")
                 return None
             
-            # Wait for page settling (human-like behavior)
-            await page.waitFor(random.randint(1000, 2000))
+            # Wait for page settling (minimal wait)
+            await page.waitFor(500)
             
             # Check for rate limiting or blocking
             page_title = await page.title()
@@ -915,8 +900,8 @@ class PuppeteerScreenshotManager:
                 print(f"🚫 Page appears to be blocked: {url}")
                 return None
             
-            # CRITICAL: Set page zoom to 85% for better screenshot size and content visibility
-            await page.evaluate("document.body.style.zoom = '0.85'")
+            # CRITICAL: Set page zoom to 67% as in reference server.py
+            await page.evaluate("document.body.style.zoom = '0.67'")
             await page.waitFor(500)
             
             # Scroll to ensure we can see the complete MCQ content
@@ -944,28 +929,32 @@ class PuppeteerScreenshotManager:
             page_width = await page.evaluate("document.body.scrollWidth")
             viewport_height = await page.evaluate("window.innerHeight")
             
-            print(f"📏 Page dimensions with 85% zoom: {page_width}x{page_height}, viewport: {viewport_height}")
+            print(f"📏 Page dimensions with 67% zoom: {page_width}x{page_height}, viewport: {viewport_height}")
             
-            # Calculate central area cropping with improved padding for better content visibility
-            crop_left = 50   # Reduced from 100 to get more content width
-            crop_top = 50    # Reduced from 100 to get more content height  
-            crop_right = 350 # Reduced from 430 to get more content width
+            # Calculate central area cropping with increased padding
+            crop_left = 200  # Increased from 100 to 200 (100px more on left)
+            crop_top = 100
+            crop_right = 530  # Increased from 430 to 530 (100px more on right)
+            crop_bottom = 300  # New: crop 300px from bottom
             
             screenshot_x = crop_left
             screenshot_y = crop_top
             screenshot_width = min(chosen_viewport['width'] - crop_left - crop_right, page_width - screenshot_x)
             
-            # Calculate height to include question, options, AND answer section with better coverage
-            base_height = 800   # Increased from 600 for better content coverage
-            answer_section_height = 800  # Increased from 600 for better answer section coverage
+            # Calculate height with bottom cropping
+            base_height = 600
+            answer_section_height = 600
             screenshot_height = base_height + answer_section_height
             
-            max_height = 1600  # Increased from 1400 for better overall height
+            # Apply bottom cropping
+            screenshot_height = screenshot_height - crop_bottom
+            
+            max_height = 1100  # Reduced due to bottom cropping
             if screenshot_height > max_height:
                 screenshot_height = max_height
             
             # Ensure screenshot region is within page bounds
-            screenshot_height = min(screenshot_height, page_height - screenshot_y)
+            screenshot_height = min(screenshot_height, page_height - screenshot_y - crop_bottom)
             
             screenshot_region = {
                 'x': screenshot_x,
@@ -974,10 +963,7 @@ class PuppeteerScreenshotManager:
                 'height': screenshot_height
             }
             
-            print(f"🎯 MCQ screenshot region (85% zoom): x={screenshot_x}, y={screenshot_y}, w={screenshot_width}, h={screenshot_height}")
-            
-            # Add small random delay before screenshot (human-like)
-            await asyncio.sleep(random.uniform(0.3, 0.8))
+            print(f"🎯 MCQ screenshot region (67% zoom): x={screenshot_x}, y={screenshot_y}, w={screenshot_width}, h={screenshot_height}")
             
             # Capture the screenshot with maximum quality settings
             try:
@@ -985,7 +971,8 @@ class PuppeteerScreenshotManager:
                     page.screenshot(
                         clip=screenshot_region,
                         type='png',
-                        omitBackground=False
+                        omitBackground=False,
+                        quality=100  # Maximum quality for PNG (ignored for PNG but good practice)
                     ),
                     timeout=20.0
                 )
@@ -1640,32 +1627,21 @@ def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: in
             story.append(Paragraph(f"QUESTION {i} OF {len(mcqs)}", question_header_style))
             story.append(Spacer(1, 0.15*inch))
             
-            # Exam source - Create proper header with combined exam source information
-            exam_source_info = ""
-            
-            # Combine both pyp-heading and pyp-title.line-ellipsis content
-            if mcq.exam_source_heading and mcq.exam_source_title:
-                exam_source_info = f"{mcq.exam_source_heading} {mcq.exam_source_title}".strip()
-            elif mcq.exam_source_heading:
-                exam_source_info = mcq.exam_source_heading.strip()
+            # Exam source with proper format
+            exam_info = ""
+            if mcq.exam_source_heading:
+                exam_info = f"This question was previously asked in \"{mcq.exam_source_heading}\""
             elif mcq.exam_source_title:
-                exam_source_info = mcq.exam_source_title.strip()
-            
-            # Create the proper header format if we have exam source information
-            if exam_source_info:
-                exam_header = f"This question was previously asked in \"{exam_source_info}\""
+                exam_info = f"This question was previously asked in \"{mcq.exam_source_title}\""
             else:
-                # If no exam source found, skip the header entirely (no fallback)
-                exam_header = ""
+                exam_info = f"This question was previously asked in \"{topic}\""
             
-            # Only add the header if we have exam source information
-            if exam_header:
-                story.append(Paragraph(f"<i>{exam_header}</i>", 
-                    ParagraphStyle('ExamInfo', parent=styles['Normal'], 
-                        fontSize=11, textColor=secondary_color, alignment=TA_CENTER, 
-                        fontName='Helvetica-Oblique', spaceAfter=15,
-                        borderWidth=1, borderColor=accent_color, borderPadding=8, 
-                        backColor=light_color)))
+            story.append(Paragraph(f"<i>{exam_info}</i>", 
+                ParagraphStyle('ExamInfo', parent=styles['Normal'], 
+                    fontSize=11, textColor=secondary_color, alignment=TA_CENTER, 
+                    fontName='Helvetica-Oblique', spaceAfter=15,
+                    borderWidth=1, borderColor=accent_color, borderPadding=8, 
+                    backColor=light_color)))
             
             story.append(Spacer(1, 0.1*inch))
             
@@ -1680,11 +1656,10 @@ def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: in
                         # Decode base64 screenshot
                         screenshot_data = base64.b64decode(mcq.screenshot)
                         
-                        # Create image from screenshot data with proper aspect ratio handling
+                        # Create image from screenshot data
                         # Save image temporarily and create ReportLab image
                         import tempfile
                         import os
-                        from PIL import Image as PILImage
                         
                         # Create a temporary file for the image
                         temp_fd, temp_image_path = tempfile.mkstemp(suffix='.png')
@@ -1694,38 +1669,44 @@ def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: in
                         with os.fdopen(temp_fd, 'wb') as temp_file:
                             temp_file.write(screenshot_data)
                         
-                        # Process image to maintain aspect ratio and prevent stretching
+                        # Get original image dimensions to maintain aspect ratio
                         try:
                             with PILImage.open(temp_image_path) as img:
-                                # Get original dimensions
                                 original_width, original_height = img.size
                                 
                                 # Calculate aspect ratio
                                 aspect_ratio = original_width / original_height
                                 
-                                # Define target dimensions for better page coverage
-                                target_width = 7*inch   # Increased from 5*inch
-                                target_height = 5*inch  # Increased from 3*inch
+                                # Set maximum dimensions for better fit without stretching
+                                max_width = 6.5*inch  # Increased for better page fit
+                                max_height = 5*inch   # Increased for better page fit
                                 
                                 # Calculate actual dimensions maintaining aspect ratio
-                                if aspect_ratio > (target_width / target_height):
-                                    # Image is wider - fit to width
-                                    img_width = target_width
-                                    img_height = target_width / aspect_ratio
+                                if aspect_ratio > max_width / max_height:
+                                    # Width is the limiting factor
+                                    img_width = max_width
+                                    img_height = max_width / aspect_ratio
                                 else:
-                                    # Image is taller - fit to height
-                                    img_height = target_height
-                                    img_width = target_height * aspect_ratio
+                                    # Height is the limiting factor
+                                    img_height = max_height
+                                    img_width = max_height * aspect_ratio
                                 
-                                print(f"📸 Image sizing: Original {original_width}x{original_height}, Target {img_width:.1f}x{img_height:.1f}")
+                                print(f"📸 Image dimensions: {original_width}x{original_height} -> {img_width:.1f}x{img_height:.1f} inches (aspect ratio: {aspect_ratio:.2f})")
                                 
-                        except Exception as e:
-                            print(f"⚠️ Error processing image aspect ratio: {e}")
-                            # Fallback to original sizing
-                            img_width = 7*inch
-                            img_height = 5*inch
+                                # Create high-quality image with proper aspect ratio
+                                screenshot_img = ReportLabImage(
+                                    temp_image_path, 
+                                    width=img_width, 
+                                    height=img_height
+                                )
+                                
+                        except Exception as img_error:
+                            print(f"⚠️ Error processing image dimensions: {img_error}")
+                            # Fallback to original logic with improved dimensions
+                            img_width = 5*inch
+                            img_height = 3*inch
+                            screenshot_img = ReportLabImage(temp_image_path, width=img_width, height=img_height)
                         
-                        screenshot_img = ReportLabImage(temp_image_path, width=img_width, height=img_height)
                         story.append(screenshot_img)
                         story.append(Spacer(1, 0.2*inch))
                         
@@ -1892,8 +1873,8 @@ async def process_concurrent_extraction(job_id: str, topic: str, exam_type: str,
         all_results = []
         failed_urls = []
         
-        # Use smaller batches to avoid overwhelming servers
-        batch_size = 8 if scraping_method == "screenshot" else 12
+        # Use increased batch size for faster processing
+        batch_size = 10 if scraping_method == "screenshot" else 12
         
         for i in range(0, len(links), batch_size):
             batch_links = links[i:i+batch_size]
@@ -1933,71 +1914,13 @@ async def process_concurrent_extraction(job_id: str, topic: str, exam_type: str,
                               f"[BATCH {i//batch_size + 1}] {scraping_method.upper()} - Processed {processed_count}/{len(links)} links - Found {len(all_results)} MCQs - {len(failed_urls)} failed", 
                               processed_links=processed_count, mcqs_found=len(all_results))
             
-            # Longer delay between batches to avoid rate limiting
+            # Inter-batch delay (reduced to 5 seconds)
             if i + batch_size < len(links):
-                batch_delay = random.uniform(5, 10)
-                print(f"⏸️ Inter-batch delay: {batch_delay:.2f}s")
+                batch_delay = 5.0  # Fixed 5-second delay between batches
+                print(f"⏸️ Inter-batch delay: {batch_delay}s")
                 await asyncio.sleep(batch_delay)
         
         print(f"📊 PHASE 1 COMPLETE: {len(all_results)} MCQs found, {len(failed_urls)} failed")
-        
-        # PHASE 2: Aggressive retry system for failed URLs
-        if failed_urls:
-            print(f"🔄 PHASE 2: Aggressive retry for {len(failed_urls)} failed URLs...")
-            update_job_progress(job_id, "running", 
-                              f"[RETRY PHASE] Attempting to recover {len(failed_urls)} failed URLs with maximum stealth...", 
-                              processed_links=len(links), mcqs_found=len(all_results))
-            
-            # Add failed URLs to stealth manager retry queue
-            stealth_manager.retry_queue.extend(failed_urls)
-            
-            # Process with maximum stealth and patience
-            retry_results = []
-            for i, url in enumerate(failed_urls):
-                try:
-                    print(f"🕵️ STEALTH RETRY {i+1}/{len(failed_urls)}: {url}")
-                    
-                    # Ultra-conservative delay
-                    await asyncio.sleep(random.uniform(8, 15))
-                    
-                    # Try with stealth HTTP first
-                    success, html_content, status = await stealth_manager.stealth_request(url, max_attempts=3)
-                    
-                    if success and html_content:
-                        soup = BeautifulSoup(html_content, 'html.parser')
-                        
-                        if scraping_method == "screenshot":
-                            # For screenshot method, just extract text data for now
-                            mcq_data = await http_scraper._extract_mcq_from_soup(soup, url, topic, exam_type)
-                            
-                            # Try to get screenshot if text extraction worked
-                            if mcq_data and mcq_data.get('is_relevant'):
-                                screenshot = await screenshot_manager.capture_screenshot(url, topic)
-                                if screenshot:
-                                    screenshot_base64 = base64.b64encode(screenshot).decode('utf-8')
-                                    mcq_data['screenshot'] = screenshot_base64
-                        else:
-                            mcq_data = await http_scraper._extract_mcq_from_soup(soup, url, topic, exam_type)
-                        
-                        if mcq_data and mcq_data.get('is_relevant'):
-                            retry_results.append(mcq_data)
-                            print(f"🎉 RETRY SUCCESS: {url}")
-                        else:
-                            print(f"⚠️ RETRY - Not relevant: {url}")
-                    else:
-                        print(f"❌ RETRY FAILED: {url} (status: {status})")
-                
-                except Exception as e:
-                    print(f"💥 RETRY ERROR: {url} - {str(e)}")
-                
-                # Update retry progress
-                if (i + 1) % 5 == 0:
-                    update_job_progress(job_id, "running", 
-                                      f"[RETRY] {i+1}/{len(failed_urls)} retries completed - Recovered {len(retry_results)} additional MCQs", 
-                                      processed_links=len(links), mcqs_found=len(all_results) + len(retry_results))
-            
-            all_results.extend(retry_results)
-            print(f"🎉 RETRY PHASE COMPLETE: {len(retry_results)} additional MCQs recovered!")
         
         # Close resources
         if scraping_method == "screenshot":
@@ -2008,7 +1931,7 @@ async def process_concurrent_extraction(job_id: str, topic: str, exam_type: str,
         
         if not all_results:
             update_job_progress(job_id, "completed", 
-                              f"[COMPLETE] No relevant MCQs found for '{topic}' and exam type '{exam_type}' across {len(links)} links after aggressive retry.", 
+                              f"[COMPLETE] No relevant MCQs found for '{topic}' and exam type '{exam_type}' across {len(links)} links.", 
                               total_links=len(links), processed_links=len(links), mcqs_found=0)
             return
         
