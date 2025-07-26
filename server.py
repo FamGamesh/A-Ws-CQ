@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
@@ -2043,20 +2043,33 @@ async def process_concurrent_extraction(job_id: str, topic: str, exam_type: str,
 # FastAPI App Configuration
 app = FastAPI(title="Lambda MCQ Scraper", version="4.0.0")
 
-# CORS Configuration
+# CORS Configuration for AWS Lambda
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Allow all origins for testing
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
+
+# CORS Headers for Lambda responses
+def add_cors_headers(response_data):
+    """Add CORS headers to response for AWS Lambda"""
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "*",
+        "Content-Type": "application/json"
+    }
+    return JSONResponse(content=response_data, headers=headers)
 
 # API Endpoints
 @app.get("/")
 async def read_root():
     """Root endpoint"""
-    return {
+    response_data = {
         "message": "Lambda MCQ Scraper API with Puppeteer Screenshot Support", 
         "version": "4.0.0",
         "approach": "lambda_http_requests_scraping_with_puppeteer_screenshots",
@@ -2073,15 +2086,20 @@ async def read_root():
             "GET /api/test-search"
         ]
     }
+    return add_cors_headers(response_data)
 
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint with Puppeteer screenshot support"""
     try:
+        # Initialize managers and get stats
+        await http_scraper.initialize()
+        await screenshot_manager.initialize()
+        
         scraper_stats = http_scraper.get_stats()
         screenshot_stats = screenshot_manager.get_stats()
         
-        return {
+        response_data = {
             "status": "healthy",
             "version": "4.0.0",
             "approach": "lambda_http_requests_scraping_with_puppeteer_screenshots",
@@ -2096,14 +2114,16 @@ async def health_check():
             "api_keys_available": len(api_key_manager.api_keys),
             "timestamp": datetime.now().isoformat()
         }
+        return add_cors_headers(response_data)
     except Exception as e:
-        return {
+        error_data = {
             "status": "error",
             "version": "4.0.0",
             "approach": "lambda_http_requests_scraping_with_puppeteer_screenshots",
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
+        return add_cors_headers(error_data)
 
 @app.get("/api/test-search")
 async def test_search_functionality():
@@ -2135,43 +2155,82 @@ async def generate_mcq_pdf(request: SearchRequest, background_tasks: BackgroundT
     """Generate MCQ PDF with concurrent processing"""
     job_id = str(uuid.uuid4())
     
-    # Validate inputs
-    if not request.topic.strip():
-        raise HTTPException(status_code=400, detail="Topic is required")
-    
-    if request.exam_type not in ["SSC", "BPSC"]:
-        raise HTTPException(status_code=400, detail="Exam type must be SSC or BPSC")
-    
-    if request.pdf_format not in ["text", "image"]:
-        raise HTTPException(status_code=400, detail="PDF format must be 'text' or 'image'")
-    
-    # Initialize job progress
-    update_job_progress(
-        job_id, 
-        "running", 
-        f"[STARTING] Starting Lambda {request.exam_type} MCQ extraction for '{request.topic}' with 30 concurrent processes..."
-    )
-    
-    # Start background task
-    background_tasks.add_task(
-        process_mcq_extraction,
-        job_id=job_id,
-        topic=request.topic.strip(),
-        exam_type=request.exam_type,
-        pdf_format=request.pdf_format
-    )
-    
-    return {"job_id": job_id, "status": "started"}
+    try:
+        # Validate inputs
+        if not request.topic.strip():
+            raise HTTPException(status_code=400, detail="Topic is required")
+        
+        if request.exam_type not in ["SSC", "BPSC"]:
+            raise HTTPException(status_code=400, detail="Exam type must be SSC or BPSC")
+        
+        if request.pdf_format not in ["text", "image"]:
+            raise HTTPException(status_code=400, detail="PDF format must be 'text' or 'image'")
+        
+        # Initialize job progress
+        update_job_progress(
+            job_id, 
+            "running", 
+            f"[STARTING] Starting Lambda {request.exam_type} MCQ extraction for '{request.topic}' with 30 concurrent processes..."
+        )
+        
+        # Start background task
+        background_tasks.add_task(
+            process_mcq_extraction,
+            job_id=job_id,
+            topic=request.topic.strip(),
+            exam_type=request.exam_type,
+            pdf_format=request.pdf_format
+        )
+        
+        response_data = {"job_id": job_id, "status": "started"}
+        return add_cors_headers(response_data)
+        
+    except HTTPException as e:
+        # Re-raise HTTP exceptions with CORS headers
+        error_data = {"error": e.detail, "job_id": job_id}
+        return add_cors_headers(error_data)
+    except Exception as e:
+        # Handle unexpected errors
+        error_data = {"error": str(e), "job_id": job_id}
+        return add_cors_headers(error_data)
 
 @app.get("/api/job-status/{job_id}")
 async def get_job_status(job_id: str):
     """Get job status"""
-    job_data = persistent_storage.get_job(job_id)
-    
-    if not job_data:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    return JobStatus(**job_data)
+    try:
+        job_data = persistent_storage.get_job(job_id)
+        
+        if not job_data:
+            error_data = {"error": "Job not found", "job_id": job_id}
+            return add_cors_headers(error_data)
+        
+        job_status = JobStatus(**job_data)
+        return add_cors_headers(job_status.dict())
+        
+    except Exception as e:
+        error_data = {"error": str(e), "job_id": job_id}
+        return add_cors_headers(error_data)
+
+# Explicit OPTIONS handlers for CORS preflight requests
+@app.options("/")
+async def options_root():
+    """Handle CORS preflight for root endpoint"""
+    return add_cors_headers({"message": "CORS preflight successful"})
+
+@app.options("/api/health")
+async def options_health():
+    """Handle CORS preflight for health endpoint"""
+    return add_cors_headers({"message": "CORS preflight successful"})
+
+@app.options("/api/generate-mcq-pdf")
+async def options_generate_pdf():
+    """Handle CORS preflight for PDF generation endpoint"""
+    return add_cors_headers({"message": "CORS preflight successful"})
+
+@app.options("/api/job-status/{job_id}")
+async def options_job_status(job_id: str):
+    """Handle CORS preflight for job status endpoint"""
+    return add_cors_headers({"message": "CORS preflight successful"})
 
 @app.get("/api/download-pdf/{filename}")
 async def download_pdf(filename: str):
