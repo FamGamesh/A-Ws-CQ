@@ -1122,8 +1122,21 @@ class GoogleSearchAPIManager:
                 'num': min(max_results, 100),  # Google limits to 100 per request
                 'start': 1
             }
+            # Create headers to avoid referrer issues
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Referer': 'https://www.google.com/',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Sec-Fetch-Dest': 'empty',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Site': 'cross-site'
+            }
             
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(headers=headers) as session:
                 async with session.get(url, params=params) as response:
                     if response.status == 200:
                         data = await response.json()
@@ -1140,7 +1153,15 @@ class GoogleSearchAPIManager:
                     elif response.status == 403:
                         error_data = await response.text()
                         print(f"❌ Google Search API 403 Error: {error_data}")
-                        print(f"💡 This typically means API key quota exceeded or invalid API key")
+                        
+                        # Check if this is a referrer blocking issue
+                        if "API_KEY_HTTP_REFERRER_BLOCKED" in error_data or "referer" in error_data.lower():
+                            print(f"🚫 API key blocked due to referrer restrictions")
+                            print(f"💡 This API key is configured with HTTP referrer restrictions")
+                            print(f"🔧 Consider configuring API key without referrer restrictions for server-side use")
+                        else:
+                            print(f"💡 This typically means API key quota exceeded or invalid API key")
+                        
                         print(f"🔑 Using API key: {api_key[:10]}...")
                         
                         # Try next API key if available
@@ -1149,6 +1170,10 @@ class GoogleSearchAPIManager:
                             self.api_keys.remove(api_key)
                             if self.api_keys:
                                 return await self.search_testbook_mcqs(topic, exam_type, max_results)
+                        else:
+                            print("❌ No more API keys available")
+                            print("💡 All API keys may have referrer restrictions or quota issues")
+                            print("🔧 Please configure at least one API key without referrer restrictions")
                         return []
                     else:
                         error_data = await response.text()
@@ -1530,7 +1555,7 @@ async def process_mcq_request(job_id: str, topic: str, exam_type: str, max_mcqs:
         job_status[job_id]["mcqs_found"] = len(mcqs)
         
         # Generate PDF
-        pdf_path = generate_pdf(mcqs, topic, job_id, len(mcqs), 0, len(mcqs), pdf_format)
+        pdf_path = generate_pdf(mcqs, topic, job_id, len(mcqs), 0, len(mcqs), pdf_format, exam_type)
         
         # Upload to S3 if available
         pdf_url = None
@@ -1576,7 +1601,35 @@ async def search_and_filter_mcqs(topic: str, exam_type: str, max_mcqs: int, job_
         
         if not urls:
             print(f"❌ No URLs found for topic: {topic}")
-            return []
+            print(f"💡 This could be due to Google API key restrictions or quota issues")
+            print(f"🔧 Consider using direct URL scraping as fallback")
+            
+            # Fallback: Try with common Testbook URL patterns
+            print(f"🔄 Attempting fallback URL patterns for topic: {topic}")
+            fallback_urls = [
+                f"https://testbook.com/question-answer/{topic.lower().replace(' ', '-')}-mcq-questions",
+                f"https://testbook.com/question-answer/{topic.lower().replace(' ', '-')}-questions",
+                f"https://testbook.com/question-answer/{topic.lower().replace(' ', '-')}-mcq",
+                f"https://testbook.com/question-answer/{topic.lower().replace(' ', '-')}-quiz",
+                f"https://testbook.com/question-answer/{topic.lower().replace(' ', '-')}-test"
+            ]
+            
+            # Test fallback URLs
+            for url in fallback_urls:
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.head(url, timeout=aiohttp.ClientTimeout(total=5)) as response:
+                            if response.status == 200:
+                                urls.append(url)
+                                print(f"✅ Fallback URL found: {url}")
+                except:
+                    continue
+            
+            if not urls:
+                print(f"❌ No fallback URLs found either")
+                job_status[job_id]["status"] = "error"
+                job_status[job_id]["error"] = f"No URLs found for topic: {topic}. Google API keys may have restrictions."
+                return []
         
         job_status[job_id]["stage"] = "scraping_mcqs"
         job_status[job_id]["progress"] = 40
@@ -1647,7 +1700,7 @@ class GradientLine(Flowable):
             canvas.circle(x_pos, y, diamond_size, fill=1)
 
 # PDF Generation - Enhanced for Lambda
-def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: int, irrelevant_mcqs: int, total_links: int, pdf_format: str = "text") -> str:
+def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: int, irrelevant_mcqs: int, total_links: int, pdf_format: str = "text", exam_type: str = "SSC") -> str:
     """Generate BEAUTIFUL PROFESSIONAL PDF - Lambda compatible"""
     temp_files_to_cleanup = []  # Track temporary files for cleanup
     

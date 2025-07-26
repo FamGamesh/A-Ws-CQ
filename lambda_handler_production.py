@@ -103,36 +103,14 @@ class HTTPScrapingLambdaHandler:
             function_name = os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'mcq-scraper-backend')
             region = os.environ.get('AWS_REGION', 'us-east-1')
             
-            # Get account ID from Lambda context or use boto3 STS
-            try:
-                import boto3
-                sts = boto3.client('sts')
-                account_id = sts.get_caller_identity()['Account']
-                logger.info(f"📋 Using account ID: {account_id}")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not get account ID: {e}, using wildcard")
-                account_id = "*"
+            # Skip permission setup in Lambda - should be configured externally
+            logger.info("ℹ️ Skipping API Gateway permission setup (should be configured via AWS Console/CloudFormation)")
+            logger.info(f"📋 Function: {function_name} in region: {region}")
+            logger.info("💡 If API Gateway integration fails, configure permissions manually:")
+            logger.info("   aws lambda add-permission --function-name {function_name} --statement-id AllowAPIGatewayInvoke --action lambda:InvokeFunction --principal apigateway.amazonaws.com --source-arn 'arn:aws:execute-api:{region}:{account_id}:*/*/*/*'")
             
-            try:
-                # Use proper ARN format for API Gateway
-                source_arn = f"arn:aws:execute-api:{region}:{account_id}:*/*/*/*"
-                
-                self.lambda_client.add_permission(
-                    FunctionName=function_name,
-                    StatementId="AllowAPIGatewayInvoke",
-                    Action="lambda:InvokeFunction",
-                    Principal="apigateway.amazonaws.com",
-                    SourceArn=source_arn
-                )
-                logger.info(f"✅ API Gateway permissions configured with ARN: {source_arn}")
-            except Exception as e:
-                if "ResourceConflictException" in str(e):
-                    logger.info("ℹ️ API Gateway permissions already exist")
-                else:
-                    logger.warning(f"⚠️ Could not set API Gateway permissions: {e}")
-                    
         except Exception as e:
-            logger.warning(f"⚠️ Error setting up API Gateway permissions: {e}")
+            logger.warning(f"⚠️ Error in API Gateway permissions setup: {e}")
     
     def _verify_http_scraping(self):
         """Verify HTTP scraping capabilities"""
