@@ -917,8 +917,8 @@ class PuppeteerScreenshotManager:
                 print(f"🚫 Page appears to be blocked: {url}")
                 return None
             
-            # CRITICAL: Set page zoom to 67% as in reference server.py
-            await page.evaluate("document.body.style.zoom = '0.67'")
+            # CRITICAL: Set page zoom to 85% for better screenshot size and content visibility
+            await page.evaluate("document.body.style.zoom = '0.85'")
             await page.waitFor(500)
             
             # Scroll to ensure we can see the complete MCQ content
@@ -946,23 +946,23 @@ class PuppeteerScreenshotManager:
             page_width = await page.evaluate("document.body.scrollWidth")
             viewport_height = await page.evaluate("window.innerHeight")
             
-            print(f"📏 Page dimensions with 67% zoom: {page_width}x{page_height}, viewport: {viewport_height}")
+            print(f"📏 Page dimensions with 85% zoom: {page_width}x{page_height}, viewport: {viewport_height}")
             
-            # Calculate central area cropping (same as reference server.py)
-            crop_left = 100
-            crop_top = 100
-            crop_right = 430
+            # Calculate central area cropping with improved padding for better content visibility
+            crop_left = 50   # Reduced from 100 to get more content width
+            crop_top = 50    # Reduced from 100 to get more content height  
+            crop_right = 350 # Reduced from 430 to get more content width
             
             screenshot_x = crop_left
             screenshot_y = crop_top
             screenshot_width = min(chosen_viewport['width'] - crop_left - crop_right, page_width - screenshot_x)
             
-            # Calculate height to include question, options, AND answer section
-            base_height = 600
-            answer_section_height = 600
+            # Calculate height to include question, options, AND answer section with better coverage
+            base_height = 800   # Increased from 600 for better content coverage
+            answer_section_height = 800  # Increased from 600 for better answer section coverage
             screenshot_height = base_height + answer_section_height
             
-            max_height = 1400
+            max_height = 1600  # Increased from 1400 for better overall height
             if screenshot_height > max_height:
                 screenshot_height = max_height
             
@@ -976,7 +976,7 @@ class PuppeteerScreenshotManager:
                 'height': screenshot_height
             }
             
-            print(f"🎯 MCQ screenshot region (67% zoom): x={screenshot_x}, y={screenshot_y}, w={screenshot_width}, h={screenshot_height}")
+            print(f"🎯 MCQ screenshot region (85% zoom): x={screenshot_x}, y={screenshot_y}, w={screenshot_width}, h={screenshot_height}")
             
             # Add small random delay before screenshot (human-like)
             await asyncio.sleep(random.uniform(0.3, 0.8))
@@ -1642,21 +1642,32 @@ def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: in
             story.append(Paragraph(f"QUESTION {i} OF {len(mcqs)}", question_header_style))
             story.append(Spacer(1, 0.15*inch))
             
-            # Exam source
-            exam_info = ""
-            if mcq.exam_source_heading:
-                exam_info = mcq.exam_source_heading
-            elif mcq.exam_source_title:
-                exam_info = mcq.exam_source_title
-            else:
-                exam_info = f"{topic} Practice Question"
+            # Exam source - Create proper header with combined exam source information
+            exam_source_info = ""
             
-            story.append(Paragraph(f"<i>{exam_info}</i>", 
-                ParagraphStyle('ExamInfo', parent=styles['Normal'], 
-                    fontSize=11, textColor=secondary_color, alignment=TA_CENTER, 
-                    fontName='Helvetica-Oblique', spaceAfter=15,
-                    borderWidth=1, borderColor=accent_color, borderPadding=8, 
-                    backColor=light_color)))
+            # Combine both pyp-heading and pyp-title.line-ellipsis content
+            if mcq.exam_source_heading and mcq.exam_source_title:
+                exam_source_info = f"{mcq.exam_source_heading} {mcq.exam_source_title}".strip()
+            elif mcq.exam_source_heading:
+                exam_source_info = mcq.exam_source_heading.strip()
+            elif mcq.exam_source_title:
+                exam_source_info = mcq.exam_source_title.strip()
+            
+            # Create the proper header format if we have exam source information
+            if exam_source_info:
+                exam_header = f"This question was previously asked in \"{exam_source_info}\""
+            else:
+                # If no exam source found, skip the header entirely (no fallback)
+                exam_header = ""
+            
+            # Only add the header if we have exam source information
+            if exam_header:
+                story.append(Paragraph(f"<i>{exam_header}</i>", 
+                    ParagraphStyle('ExamInfo', parent=styles['Normal'], 
+                        fontSize=11, textColor=secondary_color, alignment=TA_CENTER, 
+                        fontName='Helvetica-Oblique', spaceAfter=15,
+                        borderWidth=1, borderColor=accent_color, borderPadding=8, 
+                        backColor=light_color)))
             
             story.append(Spacer(1, 0.1*inch))
             
@@ -1671,10 +1682,11 @@ def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: in
                         # Decode base64 screenshot
                         screenshot_data = base64.b64decode(mcq.screenshot)
                         
-                        # Create image from screenshot data
+                        # Create image from screenshot data with proper aspect ratio handling
                         # Save image temporarily and create ReportLab image
                         import tempfile
                         import os
+                        from PIL import Image as PILImage
                         
                         # Create a temporary file for the image
                         temp_fd, temp_image_path = tempfile.mkstemp(suffix='.png')
@@ -1684,9 +1696,36 @@ def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: in
                         with os.fdopen(temp_fd, 'wb') as temp_file:
                             temp_file.write(screenshot_data)
                         
-                        # Add image to story with proper sizing
-                        img_width = 5*inch
-                        img_height = 3*inch
+                        # Process image to maintain aspect ratio and prevent stretching
+                        try:
+                            with PILImage.open(temp_image_path) as img:
+                                # Get original dimensions
+                                original_width, original_height = img.size
+                                
+                                # Calculate aspect ratio
+                                aspect_ratio = original_width / original_height
+                                
+                                # Define target dimensions for better page coverage
+                                target_width = 7*inch   # Increased from 5*inch
+                                target_height = 5*inch  # Increased from 3*inch
+                                
+                                # Calculate actual dimensions maintaining aspect ratio
+                                if aspect_ratio > (target_width / target_height):
+                                    # Image is wider - fit to width
+                                    img_width = target_width
+                                    img_height = target_width / aspect_ratio
+                                else:
+                                    # Image is taller - fit to height
+                                    img_height = target_height
+                                    img_width = target_height * aspect_ratio
+                                
+                                print(f"📸 Image sizing: Original {original_width}x{original_height}, Target {img_width:.1f}x{img_height:.1f}")
+                                
+                        except Exception as e:
+                            print(f"⚠️ Error processing image aspect ratio: {e}")
+                            # Fallback to original sizing
+                            img_width = 7*inch
+                            img_height = 5*inch
                         
                         screenshot_img = ReportLabImage(temp_image_path, width=img_width, height=img_height)
                         story.append(screenshot_img)
