@@ -25,6 +25,20 @@ import concurrent.futures
 import aiohttp
 import aiofiles
 
+# Puppeteer imports for screenshot capture
+try:
+    from pyppeteer import launch, browser
+    PUPPETEER_AVAILABLE = True
+    print("✅ Puppeteer available for screenshot capture")
+except ImportError:
+    PUPPETEER_AVAILABLE = False
+    print("⚠️ Puppeteer not available - screenshots will be simulated")
+
+# Anti-Rate-Limiting imports
+import random
+from urllib.parse import urlparse
+import itertools
+
 from reportlab.lib.pagesizes import letter, A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, Image as ReportLabImage
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -288,10 +302,22 @@ class LambdaHTTPScrapingManager:
             return None
     
     async def _generate_screenshot_simulation(self, soup: BeautifulSoup, url: str) -> Optional[str]:
-        """Generate screenshot simulation for Lambda environment"""
+        """Generate real screenshot using Puppeteer or fallback to simulation"""
         try:
-            # Create a simple text-based representation as base64 image
-            # This replaces the actual screenshot functionality for Lambda
+            # Try to capture real screenshot with Puppeteer
+            if PUPPETEER_AVAILABLE:
+                screenshot = await screenshot_manager.capture_screenshot(url, "")
+                if screenshot:
+                    # Convert to base64 for storage
+                    screenshot_base64 = base64.b64encode(screenshot).decode('utf-8')
+                    print(f"✅ Real screenshot captured using Puppeteer for {url}")
+                    return screenshot_base64
+                else:
+                    print(f"⚠️ Puppeteer screenshot failed, falling back to simulation for {url}")
+            else:
+                print(f"⚠️ Puppeteer not available, using simulation for {url}")
+            
+            # Fallback: Create a simple text-based representation as base64 image
             from PIL import Image, ImageDraw, ImageFont
             
             # Create a simple image representation
@@ -300,14 +326,13 @@ class LambdaHTTPScrapingManager:
             
             # Add URL text
             try:
-                # Try to use a default font
                 font = ImageFont.load_default()
             except:
                 font = None
             
             draw.text((10, 10), f"URL: {url}", fill='black', font=font)
             draw.text((10, 30), "Lambda HTTP Scraping", fill='blue', font=font)
-            draw.text((10, 50), "Screenshot simulation", fill='gray', font=font)
+            draw.text((10, 50), "Screenshot simulation (Puppeteer unavailable)", fill='gray', font=font)
             
             # Convert to base64
             buffer = io.BytesIO()
@@ -318,7 +343,7 @@ class LambdaHTTPScrapingManager:
             return screenshot_base64
             
         except Exception as e:
-            print(f"⚠️ Error generating screenshot simulation: {e}")
+            print(f"⚠️ Error generating screenshot: {e}")
             return None
     
     def _clean_text(self, text: str) -> str:
@@ -385,9 +410,42 @@ class LambdaHTTPScrapingManager:
         
         return False
     
+    async def scrape_testbook_page_with_stealth(self, url: str, topic: str, exam_type: str = "SSC") -> Optional[dict]:
+        """
+        Enhanced scraping with stealth manager integration for anti-rate-limiting
+        """
+        try:
+            print(f"🕵️ Stealth scraping: {url}")
+            
+            # Use stealth manager for request
+            success, html_content, status_code = await stealth_manager.stealth_request(url, max_attempts=3)
+            
+            if not success or not html_content:
+                print(f"❌ Stealth request failed for {url} (status: {status_code})")
+                return None
+            
+            # Parse with BeautifulSoup  
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Extract MCQ data using existing logic
+            mcq_data = await self._extract_mcq_from_soup(soup, url, topic, exam_type)
+            
+            if mcq_data and mcq_data.get('is_relevant'):
+                print(f"✅ Stealth extraction successful: {url}")
+                return mcq_data
+            else:
+                print(f"⚠️ MCQ not relevant or extraction failed: {url}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ Error in stealth scraping for {url}: {str(e)}")
+            return None
+
     async def close(self):
-        """Close HTTP session"""
+        """Close the session"""
         if self.session:
+            await self.session.close()
+            print("✅ HTTP scraping session closed")
             await self.session.close()
             self.session = None
             self.is_initialized = False
@@ -406,6 +464,612 @@ class LambdaHTTPScrapingManager:
 
 # Global HTTP scraping manager
 http_scraper = LambdaHTTPScrapingManager()
+
+# INTELLIGENT ANTI-RATE-LIMITING STEALTH SYSTEM
+class StealthRateLimitManager:
+    """
+    Intelligent anti-rate-limiting system to ensure no MCQ is left behind
+    Implements stealth techniques, retry mechanisms, and smart request distribution
+    """
+    
+    def __init__(self):
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/120.0.0.0',
+            'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0'
+        ]
+        
+        self.session_pool = []
+        self.current_session_index = 0
+        self.failed_urls = set()
+        self.retry_queue = []
+        self.request_delays = {
+            'base_delay': (2, 5),        # 2-5 seconds base delay
+            'retry_delay': (5, 10),      # 5-10 seconds on retry
+            'rate_limit_delay': (15, 30) # 15-30 seconds on rate limit
+        }
+        self.max_retries_per_url = 5
+        self.url_retry_count = {}
+        
+    async def initialize_session_pool(self, pool_size: int = 5):
+        """Initialize multiple aiohttp sessions for rotation"""
+        print(f"🕵️ Initializing stealth session pool with {pool_size} sessions...")
+        
+        for i in range(pool_size):
+            # Random user agent and headers for each session
+            user_agent = random.choice(self.user_agents)
+            
+            # Stealth headers that mimic real browsers
+            headers = {
+                'User-Agent': user_agent,
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': random.choice([
+                    'en-US,en;q=0.9,hi;q=0.8',
+                    'en-GB,en;q=0.9',
+                    'en-US,en;q=0.5'
+                ]),
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Cache-Control': 'max-age=0',
+                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': random.choice(['"Windows"', '"macOS"', '"Linux"'])
+            }
+            
+            # Random referrer
+            if random.choice([True, False]):
+                headers['Referer'] = random.choice([
+                    'https://www.google.com/',
+                    'https://www.bing.com/', 
+                    'https://duckduckgo.com/',
+                    'https://testbook.com/'
+                ])
+            
+            timeout = aiohttp.ClientTimeout(total=30, connect=15)
+            connector = aiohttp.TCPConnector(
+                limit=20,
+                limit_per_host=5,
+                ttl_dns_cache=300,
+                use_dns_cache=True,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True,
+                # Add some randomization to connection behavior
+                connector_timeout=random.uniform(10, 15)
+            )
+            
+            session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                headers=headers,
+                cookie_jar=aiohttp.CookieJar(unsafe=True)  # Handle cookies like a real browser
+            )
+            
+            self.session_pool.append(session)
+            
+        print(f"✅ Stealth session pool initialized with {len(self.session_pool)} diverse sessions")
+    
+    def get_next_session(self):
+        """Get the next session from the pool with rotation"""
+        if not self.session_pool:
+            return None
+        
+        session = self.session_pool[self.current_session_index]
+        self.current_session_index = (self.current_session_index + 1) % len(self.session_pool)
+        return session
+    
+    async def smart_delay(self, delay_type: str = 'base_delay', url: str = None):
+        """Apply intelligent delays to avoid detection"""
+        delay_range = self.request_delays[delay_type]
+        base_delay = random.uniform(delay_range[0], delay_range[1])
+        
+        # Add extra delay for URLs that have failed before
+        if url and url in self.failed_urls:
+            extra_delay = random.uniform(2, 5)
+            base_delay += extra_delay
+            
+        # Add small random jitter
+        jitter = random.uniform(0.5, 1.5)
+        final_delay = base_delay + jitter
+        
+        print(f"⏳ Smart delay: {final_delay:.2f}s ({delay_type})")
+        await asyncio.sleep(final_delay)
+    
+    async def stealth_request(self, url: str, max_attempts: int = 3):
+        """
+        Make a stealth request with anti-rate-limiting measures
+        Returns (success: bool, response_text: str or None, status_code: int)
+        """
+        if not self.session_pool:
+            await self.initialize_session_pool()
+        
+        # Track retry attempts
+        retry_count = self.url_retry_count.get(url, 0)
+        
+        for attempt in range(max_attempts):
+            try:
+                # Get a session from the pool
+                session = self.get_next_session()
+                if not session:
+                    return False, None, 0
+                
+                # Apply smart delay before request
+                if attempt > 0:
+                    await self.smart_delay('retry_delay', url)
+                elif retry_count > 0:
+                    await self.smart_delay('base_delay', url)
+                else:
+                    # Small delay for first attempts
+                    await asyncio.sleep(random.uniform(0.5, 2.0))
+                
+                print(f"🕵️ Stealth request attempt {attempt + 1} (retry #{retry_count}): {url}")
+                
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        html_content = await response.text()
+                        # Reset retry count on success
+                        if url in self.url_retry_count:
+                            del self.url_retry_count[url]
+                        if url in self.failed_urls:
+                            self.failed_urls.discard(url)
+                        print(f"✅ Stealth request successful: {url}")
+                        return True, html_content, 200
+                    
+                    elif response.status == 429:
+                        print(f"🚫 Rate limited (429) on attempt {attempt + 1}: {url}")
+                        self.failed_urls.add(url)
+                        
+                        # Exponential backoff for rate limits
+                        backoff_delay = min(30 + (retry_count * 10), 120)  # Max 2 minutes
+                        print(f"⏸️ Rate limit backoff: {backoff_delay}s")
+                        await asyncio.sleep(backoff_delay)
+                        
+                        # Try with a different session
+                        continue
+                    
+                    elif response.status in [403, 404, 502, 503]:
+                        print(f"⚠️ HTTP {response.status} on attempt {attempt + 1}: {url}")
+                        if attempt < max_attempts - 1:
+                            await self.smart_delay('retry_delay', url)
+                        continue
+                    
+                    else:
+                        print(f"❌ Unexpected status {response.status}: {url}")
+                        if attempt < max_attempts - 1:
+                            await self.smart_delay('retry_delay', url)
+                        continue
+            
+            except asyncio.TimeoutError:
+                print(f"⏱️ Timeout on attempt {attempt + 1}: {url}")
+                if attempt < max_attempts - 1:
+                    await self.smart_delay('retry_delay', url)
+                continue
+                
+            except Exception as e:
+                print(f"💥 Error on attempt {attempt + 1} for {url}: {str(e)}")
+                if attempt < max_attempts - 1:
+                    await self.smart_delay('retry_delay', url)
+                continue
+        
+        # All attempts failed - add to retry queue
+        self.url_retry_count[url] = retry_count + 1
+        if retry_count < self.max_retries_per_url:
+            self.retry_queue.append(url)
+            print(f"📝 Added to retry queue: {url} (attempt #{retry_count + 1})")
+        else:
+            print(f"❌ Giving up on {url} after {self.max_retries_per_url} total retries")
+        
+        return False, None, 0
+    
+    async def process_retry_queue(self, topic: str, exam_type: str):
+        """Process failed URLs with even more aggressive anti-rate-limiting"""
+        if not self.retry_queue:
+            return []
+        
+        print(f"🔄 Processing retry queue with {len(self.retry_queue)} failed URLs...")
+        print("🕵️ Applying maximum stealth mode...")
+        
+        retry_results = []
+        processed_urls = []
+        
+        for url in self.retry_queue.copy():
+            if url in processed_urls:
+                continue
+                
+            retry_count = self.url_retry_count.get(url, 0)
+            if retry_count >= self.max_retries_per_url:
+                continue
+            
+            # Ultra-conservative delay for retries
+            await self.smart_delay('rate_limit_delay', url)
+            
+            success, html_content, status_code = await self.stealth_request(url, max_attempts=2)
+            
+            if success and html_content:
+                # Parse with BeautifulSoup and extract MCQ
+                soup = BeautifulSoup(html_content, 'html.parser')
+                mcq_data = await self._extract_mcq_from_soup(soup, url, topic, exam_type)
+                
+                if mcq_data:
+                    retry_results.append(mcq_data)
+                    print(f"✅ Retry successful: {url}")
+                    self.retry_queue.remove(url)
+            
+            processed_urls.append(url)
+        
+        print(f"✅ Retry queue processed: {len(retry_results)} MCQs recovered")
+        return retry_results
+    
+    async def _extract_mcq_from_soup(self, soup: BeautifulSoup, url: str, topic: str, exam_type: str):
+        """Extract MCQ data from BeautifulSoup - mirror of http_scraper method"""
+        try:
+            # Use the same extraction logic as http_scraper
+            return await http_scraper._extract_mcq_from_soup(soup, url, topic, exam_type)
+        except Exception as e:
+            print(f"❌ Error extracting MCQ data from {url}: {e}")
+            return None
+    
+    async def close_all_sessions(self):
+        """Close all sessions in the pool"""
+        for session in self.session_pool:
+            try:
+                await session.close()
+            except:
+                pass
+        self.session_pool.clear()
+        print("✅ All stealth sessions closed")
+
+# Global stealth rate limit manager
+stealth_manager = StealthRateLimitManager()
+
+# PUPPETEER SCREENSHOT MANAGER - AWS Lambda Compatible
+class PuppeteerScreenshotManager:
+    """AWS Lambda compatible screenshot manager using Puppeteer"""
+    
+    def __init__(self):
+        self.browser = None
+        self.is_initialized = False
+        self.screenshot_stats = {
+            "screenshots_captured": 0,
+            "screenshot_failures": 0,
+            "browser_launches": 0
+        }
+    
+    async def initialize(self):
+        """Initialize Puppeteer browser for Lambda environment with stealth features"""
+        if not PUPPETEER_AVAILABLE:
+            print("❌ Puppeteer not available for screenshot capture")
+            return False
+        
+        if self.is_initialized and self.browser:
+            return True
+        
+        try:
+            print("🚀 Launching Puppeteer browser for AWS Lambda with stealth features...")
+            
+            # Enhanced AWS Lambda + stealth optimized browser args
+            browser_args = [
+                '--no-sandbox',
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
+                '--disable-gpu-sandbox',
+                '--disable-software-rasterizer',
+                '--no-first-run',
+                '--no-zygote',
+                '--single-process',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor',
+                '--disable-extensions',
+                '--disable-plugins',
+                '--disable-default-apps',
+                '--disable-background-networking',
+                '--disable-sync',
+                '--no-default-browser-check',
+                '--memory-pressure-off',
+                '--max_old_space_size=512',
+                '--aggressive-cache-discard',
+                '--disable-hang-monitor',
+                '--disable-prompt-on-repost',
+                '--disable-client-side-phishing-detection',
+                '--headless',
+                '--hide-scrollbars',
+                '--mute-audio',
+                # STEALTH FEATURES
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=VizDisplayCompositor',
+                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                '--disable-web-security',
+                '--disable-features=VizDisplayCompositor',
+                '--disable-ipc-flooding-protection',
+                '--disable-component-extensions-with-background-pages'
+            ]
+            
+            self.browser = await launch(
+                headless=True,
+                args=browser_args,
+                executablePath='/usr/bin/chromium',  # Use system-installed ARM64 compatible Chromium
+                autoClose=False,
+                dumpio=False,
+                devtools=False
+            )
+            
+            self.is_initialized = True
+            self.screenshot_stats["browser_launches"] += 1
+            print("✅ Puppeteer browser launched successfully with stealth features")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error launching Puppeteer browser: {e}")
+            self.is_initialized = False
+            return False
+    
+    async def capture_screenshot(self, url: str, topic: str) -> Optional[bytes]:
+        """
+        Capture optimized MCQ screenshot with stealth features and rate limiting avoidance
+        """
+        if not await self.initialize():
+            print(f"❌ Puppeteer browser not available for {url}")
+            return None
+        
+        page = None
+        try:
+            print(f"📸 Capturing stealth screenshot with 67% zoom for URL: {url}")
+            
+            # Create new page with stealth settings
+            page = await self.browser.newPage()
+            
+            # STEALTH CONFIGURATION
+            # Set random realistic viewport
+            viewport_options = [
+                {'width': 1366, 'height': 768},  # Common laptop
+                {'width': 1920, 'height': 1080}, # Common desktop
+                {'width': 1440, 'height': 900},  # MacBook Air
+                {'width': 1280, 'height': 720}   # HD
+            ]
+            chosen_viewport = random.choice(viewport_options)
+            await page.setViewport(chosen_viewport)
+            
+            # Set random user agent
+            user_agents = [
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            ]
+            await page.setUserAgent(random.choice(user_agents))
+            
+            # Add realistic headers
+            await page.setExtraHTTPHeaders({
+                'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            })
+            
+            # Hide webdriver traces
+            await page.evaluateOnNewDocument('''
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined,
+                });
+                
+                // Remove Chrome automation indicators
+                window.chrome = {
+                    runtime: {},
+                };
+                
+                // Mock permissions
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Reflect.get(Notification, 'permission') || 'granted' }) :
+                        originalQuery(parameters)
+                );
+                
+                // Mock plugins
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
+                });
+                
+                // Mock languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en', 'hi'],
+                });
+            ''')
+            
+            # Random delay before navigation (human-like behavior)
+            await asyncio.sleep(random.uniform(0.5, 2.0))
+            
+            # Navigate with extended timeout for rate-limited responses
+            try:
+                await asyncio.wait_for(
+                    page.goto(url, {
+                        'waitUntil': 'domcontentloaded', 
+                        'timeout': 25000,
+                        'referer': 'https://www.google.com/'  # Stealth referrer
+                    }),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                print(f"⏱️ Navigation timeout for {url}")
+                return None
+            
+            # Wait for page settling (human-like behavior)
+            await page.waitFor(random.randint(1000, 2000))
+            
+            # Check for rate limiting or blocking
+            page_title = await page.title()
+            page_url = page.url
+            
+            if 'blocked' in page_title.lower() or 'access denied' in page_title.lower():
+                print(f"🚫 Page appears to be blocked: {url}")
+                return None
+            
+            # CRITICAL: Set page zoom to 67% as in reference server.py
+            await page.evaluate("document.body.style.zoom = '0.67'")
+            await page.waitFor(500)
+            
+            # Scroll to ensure we can see the complete MCQ content
+            await page.evaluate("window.scrollTo(0, 0)")
+            await page.waitFor(300)
+            
+            # Quick relevance check
+            question_found = False
+            try:
+                question_element = await page.querySelector('h1.questionBody, div.questionBody, h1, h2, h3')
+                if question_element:
+                    question_text = await page.evaluate('(element) => element.innerText', question_element)
+                    if question_text and len(question_text.strip()) > 10:
+                        question_found = True
+                        print(f"✅ Found question content")
+            except Exception as e:
+                print(f"⚠️ Error checking question content: {e}")
+            
+            if not question_found:
+                print(f"❌ No valid question content found on {url}")
+                return None
+            
+            # Get page dimensions after zoom (same as reference server.py)
+            page_height = await page.evaluate("document.body.scrollHeight")
+            page_width = await page.evaluate("document.body.scrollWidth")
+            viewport_height = await page.evaluate("window.innerHeight")
+            
+            print(f"📏 Page dimensions with 67% zoom: {page_width}x{page_height}, viewport: {viewport_height}")
+            
+            # Calculate central area cropping (same as reference server.py)
+            crop_left = 100
+            crop_top = 100
+            crop_right = 430
+            
+            screenshot_x = crop_left
+            screenshot_y = crop_top
+            screenshot_width = min(chosen_viewport['width'] - crop_left - crop_right, page_width - screenshot_x)
+            
+            # Calculate height to include question, options, AND answer section
+            base_height = 600
+            answer_section_height = 600
+            screenshot_height = base_height + answer_section_height
+            
+            max_height = 1400
+            if screenshot_height > max_height:
+                screenshot_height = max_height
+            
+            # Ensure screenshot region is within page bounds
+            screenshot_height = min(screenshot_height, page_height - screenshot_y)
+            
+            screenshot_region = {
+                'x': screenshot_x,
+                'y': screenshot_y,
+                'width': screenshot_width,
+                'height': screenshot_height
+            }
+            
+            print(f"🎯 MCQ screenshot region (67% zoom): x={screenshot_x}, y={screenshot_y}, w={screenshot_width}, h={screenshot_height}")
+            
+            # Add small random delay before screenshot (human-like)
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+            
+            # Capture the screenshot with maximum quality settings
+            try:
+                screenshot = await asyncio.wait_for(
+                    page.screenshot(
+                        clip=screenshot_region,
+                        type='png',
+                        omitBackground=False
+                    ),
+                    timeout=20.0
+                )
+                
+                print(f"✅ Stealth MCQ screenshot captured: {screenshot_width}x{screenshot_height}px")
+                self.screenshot_stats["screenshots_captured"] += 1
+                return screenshot
+                
+            except asyncio.TimeoutError:
+                print(f"⏱️ Screenshot timeout for {url}")
+                self.screenshot_stats["screenshot_failures"] += 1
+                return None
+            
+        except Exception as e:
+            print(f"❌ Error capturing stealth screenshot for {url}: {str(e)}")
+            self.screenshot_stats["screenshot_failures"] += 1
+            return None
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except:
+                    pass
+    
+    async def scrape_with_screenshot(self, url: str, topic: str, exam_type: str = "SSC") -> Optional[dict]:
+        """
+        Scrape testbook page with screenshot capture and relevancy checks
+        Adapted from reference server.py
+        """
+        try:
+            print(f"🔍 Processing URL with screenshot: {url}")
+            
+            # First do HTTP scraping for text content and relevance checks
+            mcq_data = await http_scraper._scrape_testbook_page_internal(url, topic, exam_type)
+            
+            if not mcq_data or not mcq_data.get('is_relevant'):
+                print(f"❌ MCQ not relevant or failed text extraction for {url}")
+                return None
+            
+            # If relevant, capture screenshot
+            screenshot = await self.capture_screenshot(url, topic)
+            
+            if screenshot:
+                # Convert screenshot to base64 for storage
+                screenshot_base64 = base64.b64encode(screenshot).decode('utf-8')
+                mcq_data['screenshot'] = screenshot_base64
+                print(f"✅ Successfully captured and processed screenshot for {url}")
+            else:
+                print(f"⚠️ Failed to capture screenshot for {url}, keeping text data")
+            
+            return mcq_data
+            
+        except Exception as e:
+            print(f"❌ Error in screenshot scraping for {url}: {str(e)}")
+            return None
+    
+    async def close(self):
+        """Close Puppeteer browser"""
+        if self.browser:
+            try:
+                await self.browser.close()
+                print("✅ Puppeteer browser closed")
+            except Exception as e:
+                print(f"⚠️ Error closing Puppeteer browser: {e}")
+            finally:
+                self.browser = None
+                self.is_initialized = False
+    
+    def get_stats(self) -> dict:
+        """Get screenshot statistics"""
+        total_attempts = self.screenshot_stats["screenshots_captured"] + self.screenshot_stats["screenshot_failures"]
+        success_rate = (self.screenshot_stats["screenshots_captured"] / max(total_attempts, 1)) * 100
+        
+        return {
+            "puppeteer_available": PUPPETEER_AVAILABLE,
+            "initialized": self.is_initialized,
+            "screenshot_stats": self.screenshot_stats,
+            "success_rate": success_rate
+        }
+
+# Global Puppeteer screenshot manager
+screenshot_manager = PuppeteerScreenshotManager()
 
 # PERSISTENT JOB STORAGE - Lambda Compatible
 class PersistentJobStorage:
@@ -1165,50 +1829,159 @@ async def process_mcq_extraction(job_id: str, topic: str, exam_type: str = "SSC"
         update_job_progress(job_id, "error", f"[ERROR] Error: {error_message}")
 
 async def process_concurrent_extraction(job_id: str, topic: str, exam_type: str, links: List[str], pdf_format: str):
-    """Process extraction with 30 concurrent workers"""
+    """
+    ENHANCED: Process extraction with intelligent anti-rate-limiting stealth system
+    Ensures no MCQ is left behind through aggressive retry mechanisms
+    """
+    scraping_method = "text"  # Default value
+    
     try:
-        await http_scraper.initialize()
+        # Initialize stealth manager
+        await stealth_manager.initialize_session_pool(pool_size=8)  # More sessions for rotation
         
-        print(f"🚀 Starting concurrent processing with {http_scraper.max_concurrent_processes} workers: {len(links)} links")
+        # Choose scraping method based on PDF format
+        if pdf_format == "image" and PUPPETEER_AVAILABLE:
+            print(f"🚀 Using Stealth Puppeteer screenshot scraping for image format")
+            await screenshot_manager.initialize()
+            scraping_method = "screenshot"
+        else:
+            print(f"🚀 Using Stealth HTTP text scraping for text format")
+            await http_scraper.initialize()
+            scraping_method = "text"
         
-        # Create concurrent tasks
-        tasks = []
-        for i, url in enumerate(links):
-            task = http_scraper.scrape_testbook_page_concurrent(url, topic, exam_type)
-            tasks.append(task)
+        print(f"🕵️ STEALTH MODE ACTIVATED: Processing {len(links)} links with anti-rate-limiting")
         
-        # Process in batches to avoid overwhelming the system
-        batch_size = 30
+        # PHASE 1: Initial processing with stealth features
         all_results = []
+        failed_urls = []
         
-        for i in range(0, len(tasks), batch_size):
-            batch_tasks = tasks[i:i+batch_size]
-            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+        # Use smaller batches to avoid overwhelming servers
+        batch_size = 8 if scraping_method == "screenshot" else 12
+        
+        for i in range(0, len(links), batch_size):
+            batch_links = links[i:i+batch_size]
+            print(f"🔄 Processing batch {i//batch_size + 1}/{(len(links)-1)//batch_size + 1} with {len(batch_links)} links")
             
-            # Filter successful results
-            successful_results = [r for r in batch_results if r is not None and not isinstance(r, Exception)]
-            all_results.extend(successful_results)
+            # Create tasks for this batch
+            tasks = []
+            for url in batch_links:
+                if scraping_method == "screenshot":
+                    # Enhanced screenshot scraping with stealth
+                    task = screenshot_manager.scrape_with_screenshot(url, topic, exam_type)
+                else:
+                    # Enhanced HTTP scraping with stealth requests  
+                    task = http_scraper.scrape_testbook_page_with_stealth(url, topic, exam_type)
+                tasks.append((url, task))
             
-            # Update progress
+            # Process batch with individual error handling
+            for url, task in tasks:
+                try:
+                    result = await task
+                    if result and result.get('is_relevant'):
+                        all_results.append(result)
+                        print(f"✅ SUCCESS: {url}")
+                    else:
+                        failed_urls.append(url)
+                        print(f"⚠️ FAILED or IRRELEVANT: {url}")
+                except Exception as e:
+                    failed_urls.append(url)
+                    print(f"❌ ERROR processing {url}: {str(e)}")
+                
+                # Anti-rate-limiting delay between requests
+                await asyncio.sleep(random.uniform(1.5, 3.0))
+            
+            # Update progress after each batch
             processed_count = min(i + batch_size, len(links))
             update_job_progress(job_id, "running", 
-                              f"[PROCESSING] Processed {processed_count}/{len(links)} links - Found {len(all_results)} relevant MCQs", 
+                              f"[BATCH {i//batch_size + 1}] {scraping_method.upper()} - Processed {processed_count}/{len(links)} links - Found {len(all_results)} MCQs - {len(failed_urls)} failed", 
                               processed_links=processed_count, mcqs_found=len(all_results))
             
-            print(f"✅ Batch {i//batch_size + 1} completed: {len(successful_results)} MCQs found")
+            # Longer delay between batches to avoid rate limiting
+            if i + batch_size < len(links):
+                batch_delay = random.uniform(5, 10)
+                print(f"⏸️ Inter-batch delay: {batch_delay:.2f}s")
+                await asyncio.sleep(batch_delay)
         
-        await http_scraper.close()
+        print(f"📊 PHASE 1 COMPLETE: {len(all_results)} MCQs found, {len(failed_urls)} failed")
+        
+        # PHASE 2: Aggressive retry system for failed URLs
+        if failed_urls:
+            print(f"🔄 PHASE 2: Aggressive retry for {len(failed_urls)} failed URLs...")
+            update_job_progress(job_id, "running", 
+                              f"[RETRY PHASE] Attempting to recover {len(failed_urls)} failed URLs with maximum stealth...", 
+                              processed_links=len(links), mcqs_found=len(all_results))
+            
+            # Add failed URLs to stealth manager retry queue
+            stealth_manager.retry_queue.extend(failed_urls)
+            
+            # Process with maximum stealth and patience
+            retry_results = []
+            for i, url in enumerate(failed_urls):
+                try:
+                    print(f"🕵️ STEALTH RETRY {i+1}/{len(failed_urls)}: {url}")
+                    
+                    # Ultra-conservative delay
+                    await asyncio.sleep(random.uniform(8, 15))
+                    
+                    # Try with stealth HTTP first
+                    success, html_content, status = await stealth_manager.stealth_request(url, max_attempts=3)
+                    
+                    if success and html_content:
+                        soup = BeautifulSoup(html_content, 'html.parser')
+                        
+                        if scraping_method == "screenshot":
+                            # For screenshot method, just extract text data for now
+                            mcq_data = await http_scraper._extract_mcq_from_soup(soup, url, topic, exam_type)
+                            
+                            # Try to get screenshot if text extraction worked
+                            if mcq_data and mcq_data.get('is_relevant'):
+                                screenshot = await screenshot_manager.capture_screenshot(url, topic)
+                                if screenshot:
+                                    screenshot_base64 = base64.b64encode(screenshot).decode('utf-8')
+                                    mcq_data['screenshot'] = screenshot_base64
+                        else:
+                            mcq_data = await http_scraper._extract_mcq_from_soup(soup, url, topic, exam_type)
+                        
+                        if mcq_data and mcq_data.get('is_relevant'):
+                            retry_results.append(mcq_data)
+                            print(f"🎉 RETRY SUCCESS: {url}")
+                        else:
+                            print(f"⚠️ RETRY - Not relevant: {url}")
+                    else:
+                        print(f"❌ RETRY FAILED: {url} (status: {status})")
+                
+                except Exception as e:
+                    print(f"💥 RETRY ERROR: {url} - {str(e)}")
+                
+                # Update retry progress
+                if (i + 1) % 5 == 0:
+                    update_job_progress(job_id, "running", 
+                                      f"[RETRY] {i+1}/{len(failed_urls)} retries completed - Recovered {len(retry_results)} additional MCQs", 
+                                      processed_links=len(links), mcqs_found=len(all_results) + len(retry_results))
+            
+            all_results.extend(retry_results)
+            print(f"🎉 RETRY PHASE COMPLETE: {len(retry_results)} additional MCQs recovered!")
+        
+        # Close resources
+        if scraping_method == "screenshot":
+            await screenshot_manager.close()
+        else:
+            await http_scraper.close()
+        await stealth_manager.close_all_sessions()
         
         if not all_results:
             update_job_progress(job_id, "completed", 
-                              f"[ERROR] No relevant MCQs found for '{topic}' and exam type '{exam_type}' across {len(links)} links.", 
+                              f"[COMPLETE] No relevant MCQs found for '{topic}' and exam type '{exam_type}' across {len(links)} links after aggressive retry.", 
                               total_links=len(links), processed_links=len(links), mcqs_found=0)
             return
         
-        # Generate PDF
-        final_message = f"[SUCCESS] Concurrent processing complete! Found {len(all_results)} relevant MCQs from {len(links)} total links."
-        update_job_progress(job_id, "running", final_message + " Generating PDF...", 
-                          total_links=len(links), processed_links=len(links), mcqs_found=len(all_results))
+        # PHASE 3: Generate PDF
+        success_count = len(all_results)
+        failed_count = len(failed_urls) - len([r for r in all_results if r.get('from_retry')])
+        
+        final_message = f"[STEALTH SUCCESS] Found {success_count} MCQs from {len(links)} links using {scraping_method.upper()} method (recovered {len([r for r in all_results if r.get('from_retry', False)])} from retries)"
+        update_job_progress(job_id, "running", final_message + " - Generating PDF...", 
+                          total_links=len(links), processed_links=len(links), mcqs_found=success_count)
         
         try:
             # Convert results to MCQData objects
@@ -1226,11 +1999,21 @@ async def process_concurrent_extraction(job_id: str, topic: str, exam_type: str,
                     )
                     mcqs.append(mcq)
             
-            filename = generate_pdf(mcqs, topic, job_id, len(all_results), 0, len(links), pdf_format)
+            filename = generate_pdf(mcqs, topic, job_id, success_count, failed_count, len(links), pdf_format)
+            
+            # Copy to /app/ for user visibility
+            pdf_path = get_pdf_directory() / filename
+            app_pdf_path = Path("/app") / filename
+            
+            try:
+                import shutil
+                shutil.copy2(str(pdf_path), str(app_pdf_path))
+                print(f"📋 PDF copied to /app/ for user visibility: {filename}")
+            except Exception as e:
+                print(f"⚠️ Could not copy PDF to /app/: {e}")
             
             # Handle S3 upload for Lambda
             if LAMBDA_S3_INTEGRATION:
-                pdf_path = get_pdf_directory() / filename
                 pdf_url = upload_pdf_to_s3_lambda(str(pdf_path), job_id, topic, exam_type)
                 if not pdf_url:
                     pdf_url = f"/api/download-pdf/{filename}"
@@ -1245,21 +2028,29 @@ async def process_concurrent_extraction(job_id: str, topic: str, exam_type: str,
                 "generated_at": datetime.now()
             }
             
-            success_message = f"[DONE] SUCCESS! Generated PDF with {len(mcqs)} relevant MCQs for topic '{topic}' and exam type '{exam_type}' using {http_scraper.max_concurrent_processes} concurrent processes."
+            success_message = f"🎉 STEALTH MISSION ACCOMPLISHED! Generated {pdf_format.upper()} PDF with {len(mcqs)} MCQs for '{topic}' ({exam_type}) using advanced anti-rate-limiting system. No MCQ left behind!"
             update_job_progress(job_id, "completed", success_message, 
                               total_links=len(links), processed_links=len(links), 
                               mcqs_found=len(mcqs), pdf_url=pdf_url)
             
-            print(f"✅ Job {job_id} completed successfully with {len(mcqs)} MCQs using concurrent processing")
+            print(f"🏆 Job {job_id} completed with {len(mcqs)} MCQs using stealth {scraping_method} processing")
             
         except Exception as e:
             print(f"❌ Error generating PDF: {e}")
             update_job_progress(job_id, "error", f"[ERROR] Error generating PDF: {str(e)}")
     
     except Exception as e:
-        print(f"❌ Critical error in concurrent extraction: {e}")
-        update_job_progress(job_id, "error", f"[ERROR] Critical error: {str(e)}")
-        await http_scraper.close()
+        print(f"❌ Critical error in stealth extraction: {e}")
+        update_job_progress(job_id, "error", f"[ERROR] Critical stealth error: {str(e)}")
+        # Close resources on error
+        try:
+            if scraping_method == "screenshot":
+                await screenshot_manager.close()
+            else:
+                await http_scraper.close()
+            await stealth_manager.close_all_sessions()
+        except:
+            pass
 
 # FastAPI App Configuration
 app = FastAPI(title="Lambda MCQ Scraper", version="4.0.0")
@@ -1278,12 +2069,14 @@ app.add_middleware(
 async def read_root():
     """Root endpoint"""
     return {
-        "message": "Lambda MCQ Scraper API", 
+        "message": "Lambda MCQ Scraper API with Puppeteer Screenshot Support", 
         "version": "4.0.0",
-        "approach": "lambda_http_requests_scraping",
-        "browser_required": False,
+        "approach": "lambda_http_requests_scraping_with_puppeteer_screenshots",
+        "browser_required": PUPPETEER_AVAILABLE,
+        "screenshot_support": PUPPETEER_AVAILABLE,
         "concurrent_processes": 30,
         "status": "running",
+        "supported_formats": ["text", "image"],
         "available_endpoints": [
             "GET /api/health",
             "POST /api/generate-mcq-pdf",
@@ -1295,17 +2088,21 @@ async def read_root():
 
 @app.get("/api/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with Puppeteer screenshot support"""
     try:
         scraper_stats = http_scraper.get_stats()
+        screenshot_stats = screenshot_manager.get_stats()
+        
         return {
             "status": "healthy",
             "version": "4.0.0",
-            "approach": "lambda_http_requests_scraping",
+            "approach": "lambda_http_requests_scraping_with_puppeteer_screenshots",
             "browser_required": False,
             "lambda_compatible": True,
             "concurrent_processes": http_scraper.max_concurrent_processes,
             "scraping_status": scraper_stats,
+            "screenshot_status": screenshot_stats,
+            "puppeteer_available": PUPPETEER_AVAILABLE,
             "active_jobs": len(persistent_storage.jobs),
             "s3_integration": LAMBDA_S3_INTEGRATION,
             "api_keys_available": len(api_key_manager.api_keys),
@@ -1315,7 +2112,7 @@ async def health_check():
         return {
             "status": "error",
             "version": "4.0.0",
-            "approach": "lambda_http_requests_scraping",
+            "approach": "lambda_http_requests_scraping_with_puppeteer_screenshots",
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }

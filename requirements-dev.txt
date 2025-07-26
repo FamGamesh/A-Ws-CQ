@@ -4,7 +4,7 @@ uvicorn==0.25.0
 python-dotenv>=1.0.1
 pydantic>=2.6.4
 requests>=2.31.0
-playwright==1.53.0
+pyppeteer==1.0.2
 reportlab==4.2.5
 beautifulsoup4==4.12.3
 Pillow>=10.0.0
