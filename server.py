@@ -1097,6 +1097,10 @@ class GoogleSearchAPIManager:
         if not self.api_keys:
             return None
         
+        # Reset index if it's out of bounds (in case keys were removed)
+        if self.current_key_index >= len(self.api_keys):
+            self.current_key_index = 0
+        
         # Simple round-robin for now
         api_key = self.api_keys[self.current_key_index]
         self.current_key_index = (self.current_key_index + 1) % len(self.api_keys)
@@ -1183,6 +1187,15 @@ class GoogleSearchAPIManager:
                         
         except Exception as e:
             print(f"❌ Error in Google Search: {e}")
+            print(f"📋 Exception details: {str(e)}")
+            
+            # Try next API key if available and if this isn't already a retry
+            if len(self.api_keys) > 1 and api_key in self.api_keys:
+                print("🔄 Trying next API key due to exception...")
+                self.api_keys.remove(api_key)
+                if self.api_keys:
+                    return await self.search_testbook_mcqs(topic, exam_type, max_results)
+            
             return []
 
 # Global API manager
@@ -1604,6 +1617,9 @@ async def search_and_filter_mcqs(topic: str, exam_type: str, max_mcqs: int, job_
             print(f"💡 This could be due to Google API key restrictions or quota issues")
             print(f"🔧 Consider using direct URL scraping as fallback")
             
+            # Initialize urls as empty list for fallback
+            urls = []
+            
             # Fallback: Try with common Testbook URL patterns
             print(f"🔄 Attempting fallback URL patterns for topic: {topic}")
             fallback_urls = [
@@ -1622,7 +1638,8 @@ async def search_and_filter_mcqs(topic: str, exam_type: str, max_mcqs: int, job_
                             if response.status == 200:
                                 urls.append(url)
                                 print(f"✅ Fallback URL found: {url}")
-                except:
+                except Exception as e:
+                    print(f"⚠️ Error testing fallback URL {url}: {e}")
                     continue
             
             if not urls:
