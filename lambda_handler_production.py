@@ -1,6 +1,6 @@
 """
-Production Lambda Handler for MCQ Scraper - API Gateway Integration Fix
-FINAL SOLUTION: HTTP-based scraping with proper API Gateway integration
+Production Lambda Handler for MCQ Scraper - CORS Fixed Version
+FINAL SOLUTION: HTTP-based scraping with proper CORS configuration
 """
 
 import os
@@ -19,7 +19,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class HTTPScrapingLambdaHandler:
-    """HTTP-based scraping Lambda handler with API Gateway integration fix"""
+    """HTTP-based scraping Lambda handler with fixed CORS configuration"""
     
     def __init__(self):
         self.s3_client = None
@@ -33,7 +33,8 @@ class HTTPScrapingLambdaHandler:
             "browser_required": False,
             "http_client_ready": False,
             "beautifulsoup_available": False,
-            "api_gateway_ready": False
+            "api_gateway_ready": False,
+            "cors_fixed": True
         }
     
     def initialize(self):
@@ -42,7 +43,7 @@ class HTTPScrapingLambdaHandler:
             return
             
         try:
-            logger.info("🚀 Initializing HTTP Scraping Lambda Handler with API Gateway fix...")
+            logger.info("🚀 Initializing HTTP Scraping Lambda Handler with CORS fixes...")
             
             # Set HTTP scraping environment variables  
             os.environ['SCRAPING_APPROACH'] = 'http_requests'
@@ -64,7 +65,7 @@ class HTTPScrapingLambdaHandler:
             self._setup_api_gateway_permissions()
             
             # Import and initialize FastAPI app
-            from server import app
+            from server_fixed import app
             self.app = app
             
             # Initialize Mangum with optimized settings for API Gateway
@@ -87,7 +88,7 @@ class HTTPScrapingLambdaHandler:
             
             self.initialized = True
             self.scraping_status["api_gateway_ready"] = True
-            logger.info("✅ HTTP Scraping Lambda handler initialized successfully with API Gateway integration")
+            logger.info("✅ HTTP Scraping Lambda handler initialized successfully with CORS fixes")
             
         except Exception as e:
             logger.error(f"❌ Error initializing Lambda handler: {e}")
@@ -99,28 +100,6 @@ class HTTPScrapingLambdaHandler:
         try:
             # Get current function name
             function_name = os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'mcq-scraper-backend')
-            
-            # Create resource policy to allow API Gateway to invoke Lambda
-            policy_statement = {
-                "Version": "2012-10-17",
-                "Id": "default",
-                "Statement": [
-                    {
-                        "Sid": "AllowAPIGatewayInvoke",
-                        "Effect": "Allow",
-                        "Principal": {
-                            "Service": "apigateway.amazonaws.com"
-                        },
-                        "Action": "lambda:InvokeFunction",
-                        "Resource": f"arn:aws:lambda:{os.environ.get('AWS_REGION', 'us-east-1')}:*:function:{function_name}",
-                        "Condition": {
-                            "StringEquals": {
-                                "aws:SourceAccount": os.environ.get('AWS_ACCOUNT_ID', '*')
-                            }
-                        }
-                    }
-                ]
-            }
             
             try:
                 self.lambda_client.add_permission(
@@ -213,7 +192,7 @@ class HTTPScrapingLambdaHandler:
             logger.error(f"❌ Error loading secrets: {e}")
     
     def handle_request(self, event: Dict[str, Any], context: Any) -> Dict[str, Any]:
-        """Handle Lambda request with comprehensive error handling and API Gateway integration"""
+        """Handle Lambda request with comprehensive error handling and fixed CORS"""
         try:
             # Ensure initialization
             if not self.initialized:
@@ -233,10 +212,11 @@ class HTTPScrapingLambdaHandler:
             # Handle root path requests
             if path == '/' or path == '':
                 return self._create_response(200, {
-                    "message": "MCQ Scraper API",
-                    "version": "4.0.0",
+                    "message": "MCQ Scraper API - CORS Fixed",
+                    "version": "4.0.1",
                     "approach": "http_requests_scraping",
                     "browser_required": False,
+                    "cors_fixed": True,
                     "status": "running",
                     "available_endpoints": [
                         "GET /api/health",
@@ -251,7 +231,7 @@ class HTTPScrapingLambdaHandler:
             # Process through Mangum
             response = self.mangum_handler(fixed_event, context)
             
-            # Ensure CORS headers are present
+            # Ensure CORS headers are present and consistent
             if 'headers' not in response:
                 response['headers'] = {}
             
@@ -273,6 +253,7 @@ class HTTPScrapingLambdaHandler:
                 'error': 'Internal server error',
                 'message': str(e),
                 'type': 'lambda_handler_error',
+                'cors_fixed': True,
                 'scraping_status': self.scraping_status,
                 'event_type': self._detect_event_type(event),
                 'path': self._extract_path(event),
@@ -349,7 +330,7 @@ class HTTPScrapingLambdaHandler:
             # Update the Host header with the clean domain name
             fixed_event['headers']['Host'] = host_value
             
-            print(f"🔧 Fixed Host header: {fixed_event['headers']['Host']}")
+            logger.info(f"🔧 Fixed Host header: {fixed_event['headers']['Host']}")
         
         return fixed_event
     
@@ -388,13 +369,14 @@ class HTTPScrapingLambdaHandler:
             return 'Unknown'
     
     def _get_cors_headers(self) -> Dict[str, str]:
-        """Get CORS headers for responses"""
+        """Get CORS headers for responses - FIXED VERSION"""
         return {
             'Access-Control-Allow-Origin': '*',
             'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Accept, Origin',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With, Accept, Origin, X-Amz-Date, X-Api-Key, X-Amz-Security-Token, X-Amz-User-Agent',
+            'Access-Control-Allow-Credentials': 'false',  # CRITICAL FIX: Must be 'false' when using '*' for origin
             'Access-Control-Max-Age': '86400',
-            'Access-Control-Allow-Credentials': 'false'
+            'Access-Control-Expose-Headers': 'Content-Type, Authorization, X-Requested-With'
         }
     
     def _create_cors_response(self, status_code: int, body: str) -> Dict[str, Any]:
@@ -435,7 +417,7 @@ http_scraping_handler = HTTPScrapingLambdaHandler()
 
 def handler(event, context):
     """
-    HTTP Scraping Lambda entry point with API Gateway integration fix
+    HTTP Scraping Lambda entry point with CORS fixes
     This is the function that AWS Lambda will call
     """
     return http_scraping_handler.handle_request(event, context)
