@@ -799,7 +799,12 @@ class PuppeteerScreenshotManager:
                 '--disable-component-extensions-with-background-pages'
             ]
             
-            # Lambda-compatible Chromium execution
+            # Lambda-compatible Chromium execution - Disable for Lambda environment
+            if os.environ.get('AWS_LAMBDA_FUNCTION_NAME'):
+                print("🚫 Lambda environment detected - Puppeteer disabled (not supported)")
+                self.is_initialized = False
+                return False
+            
             launch_options = {
                 'headless': True,
                 'args': browser_args,
