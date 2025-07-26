@@ -65,7 +65,7 @@ class HTTPScrapingLambdaHandler:
             self._setup_api_gateway_permissions()
             
             # Import and initialize FastAPI app
-            from server_fixed import app
+            from server import app
             self.app = app
             
             # Initialize Mangum with optimized settings for API Gateway
