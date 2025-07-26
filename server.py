@@ -243,9 +243,10 @@ class LambdaHTTPScrapingManager:
                 print(f"❌ Question not relevant for topic '{topic}' on {url}")
                 return None
             
-            # Extract exam source information
+            # Extract exam source information - combine heading and title
             exam_source_heading = ""
             exam_source_title = ""
+            combined_exam_source = ""
             
             try:
                 heading_elem = soup.select_one('div.pyp-heading')
@@ -255,11 +256,20 @@ class LambdaHTTPScrapingManager:
                 title_elem = soup.select_one('div.pyp-title.line-ellipsis')
                 if title_elem:
                     exam_source_title = self._clean_text(title_elem.get_text())
+                
+                # Combine heading and title to form complete exam source
+                if exam_source_heading and exam_source_title:
+                    combined_exam_source = f"{exam_source_heading} {exam_source_title}".strip()
+                elif exam_source_heading:
+                    combined_exam_source = exam_source_heading
+                elif exam_source_title:
+                    combined_exam_source = exam_source_title
+                    
             except Exception as e:
                 print(f"⚠️ Error extracting exam source: {e}")
             
-            # Check exam type relevance
-            if not self._is_exam_type_relevant(exam_source_heading, exam_source_title, exam_type):
+            # Check exam type relevance using combined exam source
+            if not self._is_exam_type_relevant(combined_exam_source, "", exam_type):
                 print(f"❌ MCQ not relevant for exam type '{exam_type}' on {url}")
                 return None
             
@@ -289,6 +299,7 @@ class LambdaHTTPScrapingManager:
                     "answer": answer,
                     "exam_source_heading": exam_source_heading,
                     "exam_source_title": exam_source_title,
+                    "combined_exam_source": combined_exam_source,
                     "screenshot": screenshot,
                     "is_relevant": True,
                     "scraping_method": "lambda_http_requests"
@@ -386,9 +397,9 @@ class LambdaHTTPScrapingManager:
             
             return False
     
-    def _is_exam_type_relevant(self, heading: str, title: str, exam_type: str) -> bool:
+    def _is_exam_type_relevant(self, combined_source: str, unused_param: str, exam_type: str) -> bool:
         """Check if MCQ is relevant for the specified exam type"""
-        exam_text = f"{heading} {title}".lower()
+        exam_text = combined_source.lower() if combined_source else ""
         exam_type_lower = exam_type.lower()
         
         # Define exam type keywords
@@ -900,8 +911,8 @@ class PuppeteerScreenshotManager:
                 print(f"🚫 Page appears to be blocked: {url}")
                 return None
             
-            # CRITICAL: Set page zoom to 67% as in reference server.py
-            await page.evaluate("document.body.style.zoom = '0.67'")
+            # CRITICAL: Set page zoom to 85% for better content visibility while maintaining quality
+            await page.evaluate("document.body.style.zoom = '0.85'")
             await page.waitFor(500)
             
             # Scroll to ensure we can see the complete MCQ content
@@ -929,7 +940,7 @@ class PuppeteerScreenshotManager:
             page_width = await page.evaluate("document.body.scrollWidth")
             viewport_height = await page.evaluate("window.innerHeight")
             
-            print(f"📏 Page dimensions with 67% zoom: {page_width}x{page_height}, viewport: {viewport_height}")
+            print(f"📏 Page dimensions with 85% zoom: {page_width}x{page_height}, viewport: {viewport_height}")
             
             # Calculate central area cropping with increased padding
             crop_left = 200  # Increased from 100 to 200 (100px more on left)
@@ -963,7 +974,7 @@ class PuppeteerScreenshotManager:
                 'height': screenshot_height
             }
             
-            print(f"🎯 MCQ screenshot region (67% zoom): x={screenshot_x}, y={screenshot_y}, w={screenshot_width}, h={screenshot_height}")
+            print(f"🎯 MCQ screenshot region (85% zoom): x={screenshot_x}, y={screenshot_y}, w={screenshot_width}, h={screenshot_height}")
             
             # Capture the screenshot with maximum quality settings
             try:
@@ -1230,6 +1241,7 @@ class MCQData(BaseModel):
     answer: str
     exam_source_heading: str = ""
     exam_source_title: str = ""
+    combined_exam_source: str = ""
     is_relevant: bool = True
     screenshot: Optional[str] = None
 
@@ -1627,21 +1639,37 @@ def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: in
             story.append(Paragraph(f"QUESTION {i} OF {len(mcqs)}", question_header_style))
             story.append(Spacer(1, 0.15*inch))
             
-            # Exam source with proper format
+            # Exam source with proper format - avoid duplication
             exam_info = ""
-            if mcq.exam_source_heading:
-                exam_info = f"This question was previously asked in \"{mcq.exam_source_heading}\""
+            if hasattr(mcq, 'combined_exam_source') and mcq.combined_exam_source:
+                # Check if the combined source already contains the prefix
+                if "this question was previously asked in" in mcq.combined_exam_source.lower():
+                    exam_info = mcq.combined_exam_source
+                else:
+                    exam_info = f"This question was previously asked in \"{mcq.combined_exam_source}\""
+            elif mcq.exam_source_heading:
+                # Check if heading already contains the prefix
+                if "this question was previously asked in" in mcq.exam_source_heading.lower():
+                    exam_info = mcq.exam_source_heading
+                else:
+                    exam_info = f"This question was previously asked in \"{mcq.exam_source_heading}\""
             elif mcq.exam_source_title:
-                exam_info = f"This question was previously asked in \"{mcq.exam_source_title}\""
-            else:
-                exam_info = f"This question was previously asked in \"{topic}\""
+                # Check if title already contains the prefix
+                if "this question was previously asked in" in mcq.exam_source_title.lower():
+                    exam_info = mcq.exam_source_title
+                else:
+                    exam_info = f"This question was previously asked in \"{mcq.exam_source_title}\""
+            # Remove topic name fallback - no fallback to topic name
             
-            story.append(Paragraph(f"<i>{exam_info}</i>", 
-                ParagraphStyle('ExamInfo', parent=styles['Normal'], 
-                    fontSize=11, textColor=secondary_color, alignment=TA_CENTER, 
-                    fontName='Helvetica-Oblique', spaceAfter=15,
-                    borderWidth=1, borderColor=accent_color, borderPadding=8, 
-                    backColor=light_color)))
+            # Only add exam info if it exists and is not empty
+            if exam_info.strip():
+                story.append(Paragraph(f"<i>{exam_info}</i>", 
+                    ParagraphStyle('ExamInfo', parent=styles['Normal'], 
+                        fontSize=11, textColor=secondary_color, alignment=TA_CENTER, 
+                        fontName='Helvetica-Oblique', spaceAfter=15,
+                        borderWidth=1, borderColor=accent_color, borderPadding=8, 
+                        backColor=light_color)))
+            
             
             story.append(Spacer(1, 0.1*inch))
             
