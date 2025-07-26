@@ -799,14 +799,46 @@ class PuppeteerScreenshotManager:
                 '--disable-component-extensions-with-background-pages'
             ]
             
-            self.browser = await launch(
-                headless=True,
-                args=browser_args,
-                executablePath='/usr/bin/chromium',  # Use system-installed ARM64 compatible Chromium
-                autoClose=False,
-                dumpio=False,
-                devtools=False
-            )
+            # Lambda-compatible Chromium execution
+            launch_options = {
+                'headless': True,
+                'args': browser_args,
+                'autoClose': False,
+                'dumpio': False,
+                'devtools': False
+            }
+            
+            # Try different Chromium paths for Lambda environment
+            chromium_paths = [
+                '/opt/python/bin/chromium',
+                '/opt/chromium/chromium',
+                '/usr/bin/chromium-browser',
+                '/usr/bin/google-chrome',
+                None  # Use pyppeteer's bundled Chromium
+            ]
+            
+            browser_launched = False
+            for chromium_path in chromium_paths:
+                try:
+                    if chromium_path:
+                        launch_options['executablePath'] = chromium_path
+                    else:
+                        launch_options.pop('executablePath', None)  # Use bundled
+                    
+                    print(f"🔧 Trying Chromium path: {chromium_path or 'bundled'}")
+                    self.browser = await launch(**launch_options)
+                    browser_launched = True
+                    print(f"✅ Puppeteer browser launched successfully with {chromium_path or 'bundled'} Chromium")
+                    break
+                    
+                except Exception as path_error:
+                    print(f"⚠️ Failed with {chromium_path or 'bundled'}: {path_error}")
+                    continue
+            
+            if not browser_launched:
+                print("❌ All Chromium paths failed, Puppeteer unavailable")
+                self.is_initialized = False
+                return False
             
             self.is_initialized = True
             self.screenshot_stats["browser_launches"] += 1
