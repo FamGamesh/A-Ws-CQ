@@ -62,7 +62,7 @@ class ProductionS3Manager:
             # Get file size for logging
             file_size = os.path.getsize(local_file_path)
             
-            # Upload with comprehensive metadata
+            # Upload with comprehensive metadata (removed ACL for bucket compatibility)
             self.s3_client.upload_file(
                 local_file_path,
                 self.pdf_bucket,
@@ -71,7 +71,6 @@ class ProductionS3Manager:
                     'ContentType': 'application/pdf',
                     'ContentDisposition': f'attachment; filename="{filename}"',
                     'CacheControl': 'max-age=31536000',  # Cache for 1 year
-                    'ACL': 'public-read',
                     'Metadata': {
                         'job-id': job_id,
                         'topic': clean_topic,
