@@ -541,9 +541,7 @@ class StealthRateLimitManager:
                 ttl_dns_cache=300,
                 use_dns_cache=True,
                 keepalive_timeout=30,
-                enable_cleanup_closed=True,
-                # Add some randomization to connection behavior
-                connector_timeout=random.uniform(10, 15)
+                enable_cleanup_closed=True
             )
             
             session = aiohttp.ClientSession(
