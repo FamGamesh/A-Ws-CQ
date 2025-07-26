@@ -8,6 +8,7 @@ import json
 import boto3
 import logging
 import traceback
+import time
 from mangum import Mangum
 from typing import Dict, Any
 
@@ -261,7 +262,100 @@ class HTTPScrapingLambdaHandler:
             })
     
     def _fix_event_format(self, event: Dict[str, Any]) -> Dict[str, Any]:
-        """Fix event format for Mangum compatibility"""
+        """Fix event format for Mangum compatibility - Enhanced for test events"""
+        fixed_event = event.copy()
+        
+        # Detect if this is a minimal test event and create a proper API Gateway event
+        if self._is_minimal_test_event(event):
+            logger.info("🔧 Detected minimal test event - converting to API Gateway REST format")
+            fixed_event = self._create_api_gateway_rest_event(event)
+        else:
+            # Apply standard fixes for existing events
+            fixed_event = self._apply_standard_event_fixes(fixed_event)
+        
+        return fixed_event
+    
+    def _is_minimal_test_event(self, event: Dict[str, Any]) -> bool:
+        """Check if this is a minimal test event that needs conversion"""
+        # Check for minimal test event structure
+        has_http_method = 'httpMethod' in event
+        has_path = 'path' in event
+        missing_request_context = 'requestContext' not in event
+        missing_version = 'version' not in event
+        missing_resource = 'resource' not in event
+        
+        return (has_http_method and has_path and missing_request_context and 
+                missing_version and missing_resource)
+    
+    def _create_api_gateway_rest_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a proper API Gateway REST event from minimal test event"""
+        method = self._extract_method(event)
+        path = self._extract_path(event)
+        
+        # Create a complete API Gateway REST event structure
+        api_gateway_event = {
+            'resource': path,
+            'path': path,
+            'httpMethod': method,
+            'headers': event.get('headers', {}),
+            'multiValueHeaders': {},
+            'queryStringParameters': event.get('queryStringParameters'),
+            'multiValueQueryStringParameters': None,
+            'pathParameters': event.get('pathParameters'),
+            'stageVariables': None,
+            'requestContext': {
+                'resourceId': 'test-resource',
+                'resourcePath': path,
+                'httpMethod': method,
+                'extendedRequestId': 'test-extended-id',
+                'requestTime': '26/Jul/2025:06:42:04 +0000',
+                'path': f'/prod{path}',
+                'accountId': '123456789012',
+                'protocol': 'HTTP/1.1',
+                'stage': 'prod',
+                'domainPrefix': 'test-api',
+                'requestTimeEpoch': int(time.time() * 1000),
+                'requestId': 'test-request-' + str(hash(str(event)))[:8],
+                'identity': {
+                    'cognitoIdentityPoolId': None,
+                    'accountId': None,
+                    'cognitoIdentityId': None,
+                    'caller': None,
+                    'sourceIp': '127.0.0.1',
+                    'principalOrgId': None,
+                    'accessKey': None,
+                    'cognitoAuthenticationType': None,
+                    'cognitoAuthenticationProvider': None,
+                    'userArn': None,
+                    'userAgent': 'Custom User Agent String',
+                    'user': None
+                },
+                'domainName': 'test-api.execute-api.us-east-1.amazonaws.com',
+                'apiId': 'test-api-id'
+            },
+            'body': event.get('body'),
+            'isBase64Encoded': False
+        }
+        
+        # Set default headers if missing
+        if not api_gateway_event['headers']:
+            api_gateway_event['headers'] = {
+                'Host': 'test-api.execute-api.us-east-1.amazonaws.com',
+                'User-Agent': 'Custom User Agent String',
+                'X-Forwarded-For': '127.0.0.1',
+                'X-Forwarded-Port': '443',
+                'X-Forwarded-Proto': 'https'
+            }
+        
+        # Ensure Host header is properly formatted
+        if 'Host' not in api_gateway_event['headers']:
+            api_gateway_event['headers']['Host'] = 'test-api.execute-api.us-east-1.amazonaws.com'
+        
+        logger.info(f"🔧 Created API Gateway REST event: {method} {path}")
+        return api_gateway_event
+    
+    def _apply_standard_event_fixes(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply standard fixes for existing API Gateway events"""
         fixed_event = event.copy()
         
         # Ensure requestContext has all required fields
