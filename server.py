@@ -1719,7 +1719,7 @@ def generate_pdf(mcqs: List[MCQData], topic: str, job_id: str, relevant_mcqs: in
                                     img_height = max_height
                                     img_width = max_height * aspect_ratio
                                 
-                                print(f"📸 Image dimensions: {original_width}x{original_height} -> {img_width:.1f}x{img_height:.1f} inches (aspect ratio: {aspect_ratio:.2f})")
+                                print(f"📸 Image dimensions: {original_width}x{original_height} -> {img_width/inch:.1f}x{img_height/inch:.1f} inches (aspect ratio: {aspect_ratio:.2f})")
                                 
                                 # Create high-quality image with proper aspect ratio
                                 screenshot_img = ReportLabImage(
@@ -1989,16 +1989,19 @@ async def process_concurrent_extraction(job_id: str, topic: str, exam_type: str,
             
             filename = generate_pdf(mcqs, topic, job_id, success_count, failed_count, len(links), pdf_format)
             
-            # Copy to /app/ for user visibility
-            pdf_path = get_pdf_directory() / filename
-            app_pdf_path = Path("/app") / filename
-            
-            try:
-                import shutil
-                shutil.copy2(str(pdf_path), str(app_pdf_path))
-                print(f"📋 PDF copied to /app/ for user visibility: {filename}")
-            except Exception as e:
-                print(f"⚠️ Could not copy PDF to /app/: {e}")
+            # Copy to /app/ for user visibility - Skip for Lambda (no /app/ directory access)
+            if not os.environ.get('AWS_LAMBDA_FUNCTION_NAME'):
+                pdf_path = get_pdf_directory() / filename
+                app_pdf_path = Path("/app") / filename
+                
+                try:
+                    import shutil
+                    shutil.copy2(str(pdf_path), str(app_pdf_path))
+                    print(f"📋 PDF copied to /app/ for user visibility: {filename}")
+                except Exception as e:
+                    print(f"⚠️ Could not copy PDF to /app/: {e}")
+            else:
+                print(f"📋 Lambda environment: PDF saved to temporary storage only")
             
             # Handle S3 upload for Lambda
             if LAMBDA_S3_INTEGRATION:
