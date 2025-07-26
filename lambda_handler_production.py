@@ -99,18 +99,32 @@ class HTTPScrapingLambdaHandler:
     def _setup_api_gateway_permissions(self):
         """Setup permissions for API Gateway to invoke Lambda"""
         try:
-            # Get current function name
+            # Get current function name and account ID
             function_name = os.environ.get('AWS_LAMBDA_FUNCTION_NAME', 'mcq-scraper-backend')
+            region = os.environ.get('AWS_REGION', 'us-east-1')
+            
+            # Get account ID from Lambda context or use boto3 STS
+            try:
+                import boto3
+                sts = boto3.client('sts')
+                account_id = sts.get_caller_identity()['Account']
+                logger.info(f"📋 Using account ID: {account_id}")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not get account ID: {e}, using wildcard")
+                account_id = "*"
             
             try:
+                # Use proper ARN format for API Gateway
+                source_arn = f"arn:aws:execute-api:{region}:{account_id}:*/*/*/*"
+                
                 self.lambda_client.add_permission(
                     FunctionName=function_name,
                     StatementId="AllowAPIGatewayInvoke",
                     Action="lambda:InvokeFunction",
                     Principal="apigateway.amazonaws.com",
-                    SourceArn=f"arn:aws:execute-api:{os.environ.get('AWS_REGION', 'us-east-1')}:*:*/*/*"
+                    SourceArn=source_arn
                 )
-                logger.info("✅ API Gateway permissions configured")
+                logger.info(f"✅ API Gateway permissions configured with ARN: {source_arn}")
             except Exception as e:
                 if "ResourceConflictException" in str(e):
                     logger.info("ℹ️ API Gateway permissions already exist")
@@ -205,16 +219,19 @@ class HTTPScrapingLambdaHandler:
             
             logger.info(f"📥 Processing: {method} {path}")
             logger.info(f"📋 Event type: {self._detect_event_type(event)}")
+            logger.info(f"🔍 Full event structure: {json.dumps(event, default=str)[:500]}...")
             
             # Handle CORS preflight requests
             if method == 'OPTIONS':
-                return self._create_cors_response(200, json.dumps({"message": "CORS preflight successful"}))
+                response = self._create_cors_response(200, json.dumps({"message": "CORS preflight successful"}))
+                logger.info(f"📤 CORS Response: {response}")
+                return response
             
             # Handle root path requests
             if path == '/' or path == '':
-                return self._create_response(200, {
+                response = self._create_response(200, {
                     "message": "MCQ Scraper API - CORS Fixed",
-                    "version": "4.0.1",
+                    "version": "4.0.2",
                     "approach": "http_requests_scraping",
                     "browser_required": False,
                     "cors_fixed": True,
@@ -225,9 +242,25 @@ class HTTPScrapingLambdaHandler:
                         "GET /api/job-status/{job_id}"
                     ]
                 })
+                logger.info(f"📤 Root Response: {response}")
+                return response
+            
+            # Handle health check explicitly
+            if path == '/health' or path == '/api/health':
+                response = self._create_response(200, {
+                    "status": "healthy",
+                    "message": "MCQ Scraper API is running",
+                    "version": "4.0.2",
+                    "cors_fixed": True,
+                    "scraping_status": self.scraping_status,
+                    "timestamp": int(time.time() * 1000)
+                })
+                logger.info(f"📤 Health Response: {response}")
+                return response
             
             # Fix event format for Mangum compatibility
             fixed_event = self._fix_event_format(event)
+            logger.info(f"🔧 Fixed event format: {json.dumps(fixed_event, default=str)[:500]}...")
             
             # Process through Mangum
             response = self.mangum_handler(fixed_event, context)
@@ -242,7 +275,8 @@ class HTTPScrapingLambdaHandler:
             if 'Content-Type' not in response['headers']:
                 response['headers']['Content-Type'] = 'application/json'
             
-            logger.info(f"📤 Response: {response.get('statusCode', 'UNKNOWN')}")
+            logger.info(f"📤 Final Response Status: {response.get('statusCode', 'UNKNOWN')}")
+            logger.info(f"📤 Final Response Body: {str(response.get('body', 'No Body'))[:200]}...")
             return response
             
         except Exception as e:
@@ -250,7 +284,7 @@ class HTTPScrapingLambdaHandler:
             logger.error(f"📋 Event structure: {json.dumps(event, default=str)[:1000]}...")
             logger.error(traceback.format_exc())
             
-            return self._create_error_response(500, {
+            error_response = self._create_error_response(500, {
                 'error': 'Internal server error',
                 'message': str(e),
                 'type': 'lambda_handler_error',
@@ -260,6 +294,8 @@ class HTTPScrapingLambdaHandler:
                 'path': self._extract_path(event),
                 'method': self._extract_method(event)
             })
+            logger.info(f"📤 Error Response: {error_response}")
+            return error_response
     
     def _fix_event_format(self, event: Dict[str, Any]) -> Dict[str, Any]:
         """Fix event format for Mangum compatibility - Enhanced for test events"""

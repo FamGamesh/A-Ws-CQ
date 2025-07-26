@@ -1137,8 +1137,23 @@ class GoogleSearchAPIManager:
                         
                         print(f"🔍 Google Search found {len(urls)} Testbook MCQ URLs for '{topic}'")
                         return urls
+                    elif response.status == 403:
+                        error_data = await response.text()
+                        print(f"❌ Google Search API 403 Error: {error_data}")
+                        print(f"💡 This typically means API key quota exceeded or invalid API key")
+                        print(f"🔑 Using API key: {api_key[:10]}...")
+                        
+                        # Try next API key if available
+                        if len(self.api_keys) > 1:
+                            print("🔄 Trying next API key...")
+                            self.api_keys.remove(api_key)
+                            if self.api_keys:
+                                return await self.search_testbook_mcqs(topic, exam_type, max_results)
+                        return []
                     else:
+                        error_data = await response.text()
                         print(f"❌ Google Search API error: {response.status}")
+                        print(f"📋 Error details: {error_data}")
                         return []
                         
         except Exception as e:
