@@ -331,6 +331,26 @@ class HTTPScrapingLambdaHandler:
         if 'queryStringParameters' not in fixed_event:
             fixed_event['queryStringParameters'] = {}
         
+        # CRITICAL FIX: Fix Host header for mangum compatibility
+        # The Host header should not contain protocol or path, only the domain
+        if 'headers' in fixed_event and 'Host' in fixed_event['headers']:
+            host_value = fixed_event['headers']['Host']
+            
+            # Remove protocol if present
+            if host_value.startswith('https://'):
+                host_value = host_value[8:]
+            elif host_value.startswith('http://'):
+                host_value = host_value[7:]
+            
+            # Remove path if present (everything after the first '/')
+            if '/' in host_value:
+                host_value = host_value.split('/')[0]
+            
+            # Update the Host header with the clean domain name
+            fixed_event['headers']['Host'] = host_value
+            
+            print(f"🔧 Fixed Host header: {fixed_event['headers']['Host']}")
+        
         return fixed_event
     
     def _extract_method(self, event: Dict[str, Any]) -> str:
